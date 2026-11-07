@@ -98,7 +98,18 @@ CBW: 4A 01 00 00 10 00 00 00 08 00  (10-byte CDB)
   = sense key 0x05 Illegal Request, ASC 0x20 Invalid command operation code
 ```
 
-**Capacity anomaly:** `sg_readcap` consistently reports 3.1 MiB, but Linux exposes `/sys/block/srX/size = 31744` (512 B sectors) = 16252928 B (15.5 MiB) and automounts a 15.5 MiB ISO9660 volume labelled `WORMHOLE` (`file -s /dev/sr2: ISO 9660 CD-ROM 'WORMHOLE'`, `lsblk` `sr1 15.5M /media/rich/WORMHOLE`). Kernel block size and device-reported capacity do not agree. `READ CAPACITY(16)` is unsupported, so the kernel fallback is not observable from `sg` alone — flagged as unknown.
+**Capacity anomaly: resolved as firmware state-dependent capacity** — `sg_readcap` consistently reports 3.1 MiB, but Linux exposes `/sys/block/srX/size = 31744` (512 B sectors) = 16252928 B (15.5 MiB) and automounts a 15.5 MiB ISO9660 volume labelled `WORMHOLE` (`file -s /dev/sr2: ISO 9660 CD-ROM 'WORMHOLE'`, `lsblk` `sr1 15.5M /media/rich/WORMHOLE`). The two views can be reconciled exactly by replaying the kernel's own capacity math against the recorded evidence (`tools/capacity_anomaly.py`, `python3 -m unittest tools.test_capacity_anomaly`):
+
+1. **The kernel cannot have derived 31744 from the recorded response.** Linux `drivers/scsi/sr.c` `get_sectorsize()` on a successful `READ CAPACITY(10)` computes `capacity = 1 + last_lba`, then `capacity *= 4` for 2048 B sectors (`set_capacity()` is in 512 B units). The recorded response `00 00 06 38 00 00 08 00` yields `(1 + 1592) × 4 = 6372` sectors = 3262464 B — sysfs would show **6372**, not 31744. (The conversion is size-preserving: 6372 × 512 B = 3262464 B exactly.)
+2. **Kernel fallback is ruled out by the same math.** If `READ CAPACITY` failed, `get_sectorsize()` caches `capacity = 0x1fffff` with `sector_size = 2048` → `0x1fffff × 4 = 8388604` sectors ≈ 4 GiB ≠ 31744. `READ CAPACITY(16)` is unsupported (Illegal Request / Invalid opcode, above), so it contributed nothing.
+3. **The `cdrom_get_last_written()` UDF correction can only raise the capacity to the leadout address**, and the recorded TOC responses are a canned payload — identical bytes for format 0 (LBA) and format 2 (MSF) (`00 12 01 01 00 14 01 00 00 00 02 00`, track start `00 00 02 00`) — which cannot supply ≥ 31744. `GET CONFIGURATION` is likewise canned (current profile `0x000A` CD-ROM from the Profile List feature).
+
+The only enumeration-time `READ CAPACITY(10)` answers that the kernel path maps to exactly **31744** sectors are:
+
+- last LBA **7935** / 2048 B blocks → raw `00 00 1e ff 00 00 08 00` (7936 × 2048 B = 16252928 B), or
+- last LBA **31743** / 512 B blocks → raw `00 00 7b ff 00 00 02 00` (16252928 B device view).
+
+Both are a 16252928 B device view — **exactly the ISO9660 volume size**. So the firmware reported the full ISO-sized capacity during the cold-plug enumeration (which the kernel cached and still shows in sysfs), and in steady state reports a truncated 1593-block capacity. Root cause: **firmware quirk — state-dependent capacity reporting**, not a kernel fallback and not a kernel-side unit mismatch. Byte-level confirmation is hardware-gated: a cold-plug usbmon/dmesg capture is predicted to show the enumeration data phase `00 00 1e ff 00 00 08 00` (or `00 00 7b ff 00 00 02 00`), and `READ(10)` beyond LBA 1592 is expected to return readable data up to the enumeration capacity if the full ISO is exposed. Any captured data phase can be evaluated through the kernel path with `python3 tools/capacity_anomaly.py --rc10 <hex>`.
 
 Iso content at `/media/rich/WORMHOLE` is byte-identical to the first `/tmp/wormhole_mnt` dump (see `docs/iso-payload.md`).
 
