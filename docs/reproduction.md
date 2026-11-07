@@ -212,6 +212,23 @@ python3 tools/wormhole_parse.py captures/wormhole_bus3_synth_*.pcap --hid
 #   name=WORMHOLE VENDOR HID (0xD9), hid_type=mouse, footer_ok=True
 ```
 
+The multimedia type (`'6'`) can be probed the same way.  Its 12-byte
+payload layout is undetermined (see `docs/transport.md`), so send an
+all-zero frame first: it tests whether the cable accepts the `'6'`
+framing at all without presupposing where the usage byte sits.
+
+```sh
+CDB6=$(python3 -c 'import sys; sys.path.insert(0, "tools"); import wormhole_parse as wp; print(" ".join("%02x" % b for b in wp.build_vendor_hid_cdb("6", bytes(12))))')
+echo "$CDB6"
+sudo sg_raw -C 1 /dev/sgX $CDB6
+# expect (if accepted): one CBW with hid_type=multimedia, footer_ok=True;
+#   CHECK CONDITION means the cable rejects the type -- record either way.
+# With a second host: watch peer EP4 (or evtest/hidraw) for a replayed
+#   consumer usage; during a macOS GoBridge session the daemon's
+#   `key HID:` log shows the real payload layout, which is the cleanest
+#   way to map the bytes.
+```
+
 For a logged, four-phase version of the peer-to-local test (sg_raw and a direct SG_IO call, plus a 15-byte control), see `tools/peer_rerun_send.py`. It needs write access to the `/dev/sgN` node. Results: `docs/live-capture-2026-11-06.md`, re-run section.
 
 Record what you see when you do this — the peer-to-peer data channel is internal, so local capture can only show its HID/SCSI *effects*.

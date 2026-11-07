@@ -149,6 +149,35 @@ This only appears on the wire when Wormhole/GoBridge software is
 actively transferring — the idle capture in `docs/capture-log.md`
 shows only kernel CDBs, which is consistent.
 
+### Multimedia (`'6'`) packets — payload layout undetermined
+
+Type `'6'` (multimedia/key, type 3) exists in the framing above and is
+implemented end-to-end in the macOS software: `CKMEvent` maps the
+system-defined multimedia events (CGEvent type 14, subtype 8) to
+`SendMultimediaKeyEvent(this, 2, usage, 0)` → `KMMainLoop
+sendMultimediaKeyData:` → `postMultimediaHIDEventToRemote:` (0x1bccb) →
+`OTi_SendHIDPacket(3, …)` (see `docs/mac-gobridge.md`). The keys routed
+this way are Eject `0xb8`, Play `0xcd`, Next `0xb5`, Prev `0xb6`, Fast
+`0xb3` and Rewind `0xb4`; the other consumer-ish usages (Sound
+`0x80`/`0x81`, Brightness `0x48`/`0x47`, Power `0x66`, Mute `0x7f`) go
+through the *keyboard* path (`'4'`, usage at payload byte 2) instead, so
+they replay on peer EP4.
+
+What is **not** known is the 12-byte wire payload for `'6'`: none of the
+committed captures contains a `'6'` frame (no `d9 36` in any pcap), and
+the decompilation records only the call signature above — the byte
+positions of the press/release flag and the usage are unknown until a
+packet is captured, so the parser reports the payload raw (`payload_hex`)
+and no layout is assumed anywhere. For type-3 packets
+`OTiTransporter::sendHIDPacket` logs `key HID: <first 8 payload bytes>`,
+so a live macOS GoBridge session with a real media-key press pins the
+layout directly. Forwarding is verified byte-for-byte for `'3'`/`'4'`
+only (`docs/live-capture-2026-11-06.md`); whether the cable forwards
+`'6'` at all, and which peer endpoint or usage it synthesises (neither
+HID report descriptor declares a Consumer page `05 0C`), is open. To
+probe cable acceptance without presupposing a layout, send an all-zero
+`'6'` frame per `docs/reproduction.md` §6.5.
+
 ### Parser support (`tools/wormhole_parse.py`)
 
 The parser decodes both directions (verify with the live-capture

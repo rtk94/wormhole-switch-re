@@ -304,6 +304,33 @@ class TestVendorHidCdb(unittest.TestCase):
         out = wp.decode_cdb(cdb)
         self.assertEqual(out["payload_hex"], payload.hex())
 
+    def test_build_vendor_hid_cdb_multimedia_roundtrip(self):
+        # '6' multimedia uses the same 16-byte framing and the payload
+        # passes through raw -- its byte layout is undetermined (no
+        # captured '6' frame yet), so nothing is assumed here.
+        payload = bytes.fromhex("a0a1a2a3a4a5a6a7a8a9aaab")
+        cdb = wp.build_vendor_hid_cdb("6", payload)
+        self.assertEqual(len(cdb), 16)
+        self.assertEqual(cdb[0], 0xD9)
+        self.assertEqual(cdb[1], 0x36)
+        self.assertEqual(cdb[2:14], payload)
+        self.assertEqual(cdb[14:16], b"OT")
+        out = wp.decode_cdb(cdb)
+        self.assertEqual(out["hid_type"], "multimedia")
+        self.assertEqual(out["type_char"], "6")
+        self.assertEqual(out["payload_hex"], payload.hex())
+        self.assertTrue(out["valid_hid_framing"])
+
+    def test_build_vendor_hid_cdb_multimedia_all_zero_probe(self):
+        # The framing-only probe from docs/reproduction.md 6.5: an
+        # all-zero multimedia frame must be built and decode cleanly.
+        cdb = wp.build_vendor_hid_cdb("6", bytes(12))
+        self.assertEqual(cdb.hex(), "d936" + "00" * 12 + "4f54")
+        out = wp.decode_cdb(cdb)
+        self.assertEqual(out["hid_type"], "multimedia")
+        self.assertEqual(out["payload_hex"], "00" * 12)
+        self.assertTrue(out["valid_hid_framing"])
+
     def test_build_vendor_hid_cdb_pads_short_payload(self):
         cdb = wp.build_vendor_hid_cdb("3", bytes([0x01]))
         self.assertEqual(cdb[2], 0x01)
