@@ -103,9 +103,14 @@ are present.
 ## Layer 4: commands
 
 Byte 0 of the reassembled command is the command ID. The rest is
-per-command. GoBridgeDemon encodes multi-byte fields big-endian and decodes
-them with a byte swap only when `remoteIsBigEndian` (implemented in
-`KMClipboard.dylib`, not decompiled).
+per-command. GoBridgeDemon encodes multi-byte fields big-endian and UTF-16
+strings as UTF-16BE. It decodes a remote's fields with a byte swap, and picks
+the UTF-16 order, by `remoteIsBigEndian` (implemented in `KMClipboard.dylib`,
+not decompiled). For a Linux peer (OS `0x20`) that is false: the Mac reads our
+fields little-endian and our strings as UTF-16LE, while still sending its own
+big-endian. A big-endian `0x10` request from Linux crashed GoBridgeDemon (see
+[Evidence](#evidence-2026-11-11)). Login's code page and ResponseResult are
+single-byte or zero in practice, so the order there was not tested.
 
 IDs known to `CommandDataBuffer commandClassForCommandID:`: `0x00` (dummy),
 `0x01`, `0x02`, `0x04`, `0x06`–`0x09`, `0x0c`, `0x0e`, `0x10`–`0x15`, `0x37`,
@@ -115,7 +120,8 @@ operations listed in [mac-gobridge.md](mac-gobridge.md#file-transfer-command-sur
 Client side (`THMGBClient`) handles `0xa1`–`0xa9` and `0xad`, starting with
 `0xa1` ResponseResult. `0x39` is `XmlPacketCommand`; `OTiCommand doCommand:`
 drops it while the server is not connected. Login, ResponseResult and the
-clipboard form of XmlPacket are decoded below; other payloads are not.
+clipboard form of XmlPacket and the file download are decoded below; other
+payloads are not.
 
 ### OS byte
 
@@ -212,8 +218,8 @@ The XML is one line; indented here:
   | 808 | 4 | size low (observed 91 713 for a 91.7 KB `.jpg`) |
   | 812 | 12 | zero in the one sample; meaning unconfirmed |
 
-  This carries metadata only. How the receiver pulls the file contents on
-  paste (presumably the `0x04`… file commands) is not captured yet.
+  This carries metadata only. The receiver fetches the contents with
+  [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents).
 - The named-pipe name and `HookAppService` are Windows clipboard-agent
   routing, sent unchanged by the Mac.
 - No reply is sent or expected in either direction.
@@ -222,6 +228,39 @@ The XML is one line; indented here:
   success update to pastboard..` and `pbpaste` returns the text, including
   non-ASCII and non-BMP characters (`é ✓ 日本語 😀`) and `\n` line breaks. It
   does not echo the text back (`Found pboard owned by SKM...`).
+
+### DownloadMultipleFile (`0x10`): file contents
+
+From the decompiled `THMGBServer handleDownloadMultipleFile:` and the command
+classes' `initFromData`/`encodeData`; verified live from Linux. Fields are in
+the requester's byte order (little-endian from Linux, see
+[Layer 4](#layer-4-commands)); replies are big-endian.
+
+Request, requester → server:
+
+```
+10 <multiSessionID u32> <count u16> { <fileID u32> <pathLen u16> <path UTF-16, pathLen bytes> }*
+```
+
+A non-Linux sender appends `<destLen u16> <dest>` per file; the Mac decodes
+it only when the remote is a Mac.
+
+Replies, server → requester, in order:
+
+| ID | Command | Layout (big-endian) |
+|---|---|---|
+| `0xa1` | ResponseResult | `requestCommand 0x10`, `sessionID = multiSessionID`, result 0 (34 bytes) |
+| `0xa3` | DownloadFileData | `a3 <fileID u32> <totalCount u32> <currentIndex u32> <dataLength u32> <data>`; 17-byte header, at most `0x800000` data bytes per command; `currentIndex` starts at 1 |
+| `0xa7` | DownloadMultiFileFinished | `a7 <multiSessionID u32>` |
+
+`fileID` in `0xa3` is the requester's `fileID`. After the last piece of each
+file the Mac logs `setAttribute: 0` (`ChangeFileAttribute`); it sent no
+separate packet for it in the test. A missing file gets UploadMultiFileError
+(ID not confirmed). Other IDs from the decompile, not seen live:
+`0xa5` DownloadFileDataFailed, `0xa6` ResponseDownloadMultiFileZeroLength
+(`sessionID u32, count u16, fileIDs`), `0xab` DownloadMultiFileException.
+`0x0b` DownloadFile has a class but is not in `commandClassForCommandID:`, so
+the Mac cannot receive it.
 
 ## Linux peer: `tools/upipe_peer.py`
 
@@ -236,11 +275,15 @@ python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --second
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 60 --login linux-peer
 # Also push text to the Mac's clipboard once the Mac accepts the login
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 20 --login linux-peer --clipboard "hello"
+# Fetch a file from the Mac (absolute path on the Mac); saved as RUN/download_1.bin
+python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 30 --login linux-peer --download "/Users/<user>/file.bin"
 python3 -m unittest tools.test_upipe_peer
 ```
 
 Output: one `pkt_NNNN.bin` per fetched packet and `upipe_peer.jsonl`
-(`state`, `packet`, `command`, `queue`, `sent` records).
+(`state`, `packet`, `command`, `queue`, `sent` records), plus
+`download_<fileID>.bin` per `--download`. `--endian big` sends the request
+big-endian; it exists only to reproduce the crash below.
 
 Mac-side tracing uses `tools/gobridge_scsi.d` (dtrace on GoBridgeDemon's
 `SCSITaskClass` calls; usage in the script header). It needs root, so it
@@ -257,6 +300,8 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `login` (`--login linux-peer`) | Mac's Login (seq 3, session 3) arrives; Linux queues ResponseResult + its own Login (4 packets); all 4 sends succeed; the Mac fetches all 4, logs `ResponseResult(0xa1) {_RequestCommand:1, _RequestResult:0, …}`, `did login to remote`, `[Login Command] Os Type:20 ,name: linux-peer`, `remote has login`, `remote is linux`, and replies with its own 44-byte ResponseResult (OS `0x16`). Wormhole.app logs `remoteDidLoginWithName linux-peer, os: 32` |
 | `xfer` (`--login`, then user actions on the Mac) | Same handshake. Copying text sends a 587-byte XmlPacket (`CB_Format_Text`, seq 7); copying a `.jpg` in Finder sends a 2 049-byte one (`CB_Format_File`, one `NodeInfo`, seq 8). Dragging a file toward the Linux side sent nothing: the Mac logs `DragDrop getScreenFrame` and later `Clear the dragdropboard contents`. The Mac logged only these two pasteboard changes (`changeCount` 1 and 2). 39 061 polls, no send errors |
 | `clip` (`--login linux-peer --clipboard …`, two runs) | Linux's text arrives in the Mac's pasteboard (checked with `pbpaste` over ssh). The encoder reproduces the Mac's own 587-byte text packet from `xfer` byte for byte. In a second run 40 s later the Mac sent no Login; after the tool was changed to log in first, the Mac answered with a ResponseResult and accepted the second push |
+| `dl` (`--download`, big-endian request) | The Mac's GoBridgeDemon threw an uncaught `NSRangeException` (`subdataWithRange: range {12, 23040} exceeds data length 102`): 23040 is `0x5A00`, our big-endian path length `0x005A` read little-endian. Wormhole.app relaunched the daemon (new PID), which sent Login again |
+| `dl…le` (`--download`, little-endian request) | Mac logs `remote is linux`, `sever will handle command: DownloadMultipleFile(0x10)`, `Send command: A3`, `setAttribute: 0`, `Send command: A7`. Linux receives ResponseResult (34 bytes, session 1), one 300 017-byte `0xa3` (file 1, index 1 of 1) and `0xa7`. The saved 300 000-byte file's SHA-256 matches the Mac's random test file |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
 `tools/filter_usbmon.py` (19 830 records, sha256 `11b0da0e…`), shows
@@ -269,12 +314,12 @@ because they contain the Mac's host name.
 
 ## Open questions
 
-- File contents: how a receiver fetches a copied file (`NodeInfo` gives
-  only metadata), and what drag-and-drop needs from the peer (likely the
-  mouse/KM side; the Mac abandoned the drag). Next step: answer with Linux
-  file requests, or capture a Windows peer pasting.
+- Drag-and-drop: what it needs from the peer (likely the mouse/KM side; the
+  Mac abandoned the drag).
+- Files over 8 MiB (several `0xa3` pieces), missing files (UploadMultiFileError
+  ID) and the `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`).
+- The Mac as requester: serving `0x10` from Linux, and uploads (`0x11`…).
 - Image clipboard formats (only text and file seen).
 - `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
-- `remoteIsBigEndian` rule (affects how the Mac decodes our big-endian fields).
 - Windows peer parity: the same commands are expected but not yet captured.

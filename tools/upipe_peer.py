@@ -24,7 +24,8 @@ docs/upipe-protocol.md):
                + len bytes of the command (all u32 little-endian);
                a command ends with an all-zero chunk (seq 0)
   cmd    byte 0 = command ID (0x01 Login, 0x02 Logout, 0xA1 ResponseResult,
-               ...); the rest is per command, multi-byte fields big-endian
+               ...); the rest is per command.  The Mac sends multi-byte
+               fields big-endian but reads a Linux peer's little-endian
 
 Raw packets can carry host names and user data: keep --out outside the repo.
 
@@ -69,14 +70,21 @@ STATES = {
 
 CMD_LOGIN = 0x01
 CMD_LOGOUT = 0x02
+CMD_DOWNLOAD_MULTI = 0x10
 CMD_XML = 0x39
 CMD_RESPONSE = 0xA1
+CMD_FILE_DATA = 0xA3
+CMD_DOWNLOAD_FINISHED = 0xA7
 COMMANDS = {
     0x00: "Dummy", 0x01: "Login", 0x02: "Logout", 0x04: "GetDirectoryInfo",
     0x06: "DeleteDirectory", 0x07: "MakeNewDirectory", 0x08: "DeleteFile",
-    0x09: "RenameFile", 0x0C: "ChangeFileAttribute", 0x37: "SyncDynamic",
-    0x39: "XmlPacket", 0xA1: "ResponseResult",
+    0x09: "RenameFile", 0x0C: "ChangeFileAttribute", 0x10: "DownloadMultipleFile",
+    0x37: "SyncDynamic", 0x39: "XmlPacket", 0xA1: "ResponseResult",
+    0xA3: "DownloadFileData", 0xA5: "DownloadFileDataFailed",
+    0xA6: "ResponseDownloadMultiFileZeroLength", 0xA7: "DownloadMultiFileFinished",
+    0xAB: "DownloadMultiFileException",
 }
+FILE_DATA_HEADER = 17   # FileDataCommand headerLength: id + 4 x u32
 
 # GB OS byte: high nibble = type, low nibble = version (KMClipboard.dylib).
 OS_WIN, OS_MAC, OS_LINUX = 0x00, 0x10, 0x20
@@ -319,6 +327,37 @@ def decode_clipboard(xml):
     return out
 
 
+def encode_download_request(multi_session_id, files, endian="<"):
+    """DownloadMultipleFile (0x10): ask the peer's server to send us files.
+
+    10 <multiSessionID u32> <count u16> { <fileID u32> <pathLen u16> <path UTF-16> }*
+    The Mac decodes a remote's fields with a byte swap, and picks the UTF-16
+    order, by remoteIsBigEndian, which is false for a Linux peer: so a Linux
+    peer sends little-endian fields and UTF-16LE paths (the default).  Sending
+    big-endian crashed GoBridgeDemon (NSRangeException on the swapped length).
+    A non-Linux sender would append <destLen u16> <dest> per file; the Mac
+    skips that for Linux peers.
+    """
+    utf16 = "utf-16-be" if endian == ">" else "utf-16-le"
+    out = bytes([CMD_DOWNLOAD_MULTI]) + struct.pack(endian + "IH", multi_session_id, len(files))
+    for file_id, path in files:
+        raw = path.encode(utf16)
+        out += struct.pack(endian + "IH", file_id, len(raw)) + raw
+    return out
+
+
+def decode_file_data(cmd):
+    """DownloadFileData (0xA3): a3 <sessionFileID> <totalCount> <index> <dataLength> <data>."""
+    if len(cmd) < FILE_DATA_HEADER or cmd[0] != CMD_FILE_DATA:
+        raise ValueError("not a DownloadFileData")
+    file_id, total, index, length = struct.unpack(">IIII", cmd[1:FILE_DATA_HEADER])
+    data = cmd[FILE_DATA_HEADER:FILE_DATA_HEADER + length]
+    if len(data) != length:
+        raise ValueError("DownloadFileData truncated: %d of %d bytes" % (len(data), length))
+    return {"file_id": file_id, "total": total, "index": index, "data_length": length,
+            "data": data}
+
+
 def describe_command(cmd):
     if not cmd:
         return {"command": None}
@@ -330,6 +369,12 @@ def describe_command(cmd):
             out.update(decode_response(cmd))
         elif cmd[0] == CMD_XML:
             out.update(decode_clipboard(decode_xml_packet(cmd)))
+        elif cmd[0] == CMD_FILE_DATA:
+            d = decode_file_data(cmd)
+            d.pop("data")
+            out.update(d)
+        elif cmd[0] == CMD_DOWNLOAD_FINISHED and len(cmd) >= 5:
+            out["session_id"] = struct.unpack(">I", cmd[1:5])[0]
     except ValueError as e:
         out["decode_error"] = str(e)
     return out
@@ -386,9 +431,15 @@ def main(argv):
                     help="OS type to announce with --login (default linux)")
     ap.add_argument("--clipboard", metavar="TEXT",
                     help="with --login: push TEXT to the peer's clipboard once logged in")
+    ap.add_argument("--download", metavar="PEER_PATH", action="append",
+                    help="with --login: ask the peer to send this file (repeatable); "
+                         "saved as download_<n>.bin in --out")
+    ap.add_argument("--endian", choices=["big", "little"], default="little",
+                    help="byte order for --download fields (default little: the Mac decodes "
+                         "a Linux peer little-endian; big crashed its daemon)")
     args = ap.parse_args(argv)
-    if args.clipboard is not None and not args.login:
-        ap.error("--clipboard needs --login")
+    if (args.clipboard is not None or args.download) and not args.login:
+        ap.error("--clipboard and --download need --login")
     os_byte = {v: k for k, v in OS_NAMES.items()}[args.os]
 
     os.makedirs(args.out, exist_ok=True)
@@ -402,7 +453,9 @@ def main(argv):
     fd = os.open(args.dev, os.O_RDWR)
     fetch, send = build_fetch_cdb(), build_send_cdb()
     framer, reasm, txq = Framer(), Reassembler(), []
-    clipboard_sent = False
+    after_login_sent = False
+    endian = ">" if args.endian == "big" else "<"
+    started = set()                     # file IDs whose download file we have opened
     end = time.time() + args.seconds
     last_state, n_rx, n_tx = None, 0, 0
     emit({"event": "start", "dev": args.dev, "fetch_cdb": fetch.hex(), "send_cdb": send.hex(),
@@ -460,10 +513,20 @@ def main(argv):
                     if args.login and cmd[:1] == bytes([CMD_LOGIN]):
                         queue(encode_response(CMD_LOGIN, 0, os_byte), "login-response")
                     # The peer's ResponseResult to our Login = we are logged in.
-                    if (args.clipboard is not None and not clipboard_sent
-                            and cmd[:2] == bytes([CMD_RESPONSE, CMD_LOGIN])):
-                        queue(encode_clipboard_text(args.clipboard), "clipboard")
-                        clipboard_sent = True
+                    if cmd[:2] == bytes([CMD_RESPONSE, CMD_LOGIN]) and not after_login_sent:
+                        after_login_sent = True
+                        if args.clipboard is not None:
+                            queue(encode_clipboard_text(args.clipboard), "clipboard")
+                        if args.download:
+                            files = list(enumerate(args.download, start=1))
+                            queue(encode_download_request(1, files, endian), "download")
+                    if cmd[:1] == bytes([CMD_FILE_DATA]) and "decode_error" not in desc:
+                        piece = decode_file_data(cmd)
+                        path = os.path.join(args.out, "download_%d.bin" % piece["file_id"])
+                        # currentIndex starts at 1; truncate on the first piece seen.
+                        with open(path, "ab" if piece["file_id"] in started else "wb") as f:
+                            f.write(piece["data"])
+                        started.add(piece["file_id"])
                 if not ok:
                     break
 

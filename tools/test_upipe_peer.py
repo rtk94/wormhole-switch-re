@@ -1,6 +1,7 @@
 import ctypes
 import hashlib
 import os
+import struct
 import sys
 import unittest
 
@@ -184,6 +185,40 @@ class TestClipboard(unittest.TestCase):
     def test_bad_length(self):
         with self.assertRaises(ValueError):
             u.decode_xml_packet(b"\x39\x00\x00\x00\x09abc")
+
+
+class TestDownload(unittest.TestCase):
+    def test_request_layout_big_endian(self):
+        cmd = u.encode_download_request(1, [(7, "/a/b")], endian=">")
+        self.assertEqual(cmd.hex(), "10" "00000001" "0001" "00000007" "0008"
+                         + "/a/b".encode("utf-16-be").hex())
+
+    def test_request_little_endian_default(self):
+        # What the Mac accepted from a Linux peer (dl_2026-11-11_0919le run).
+        cmd = u.encode_download_request(1, [(7, "/a")])
+        self.assertEqual(cmd.hex(), "10" "01000000" "0100" "07000000" "0400"
+                         + "/a".encode("utf-16-le").hex())
+
+    def test_request_two_files(self):
+        cmd = u.encode_download_request(3, [(1, "/x"), (2, "/yy")])
+        self.assertEqual(cmd[5:7], b"\x02\x00")
+        self.assertEqual(len(cmd), 7 + (6 + 4) + (6 + 6))
+
+    def test_file_data(self):
+        cmd = bytes([0xA3]) + struct.pack(">IIII", 5, 2, 0, 3) + b"abc"
+        d = u.decode_file_data(cmd)
+        self.assertEqual((d["file_id"], d["total"], d["index"], d["data"]), (5, 2, 0, b"abc"))
+        desc = u.describe_command(cmd)
+        self.assertEqual((desc["command_name"], desc["data_length"]), ("DownloadFileData", 3))
+        self.assertNotIn("data", desc)
+
+    def test_file_data_truncated(self):
+        cmd = bytes([0xA3]) + struct.pack(">IIII", 5, 1, 0, 9) + b"abc"
+        self.assertIn("decode_error", u.describe_command(cmd))
+
+    def test_finished(self):
+        d = u.describe_command(bytes([0xA7, 0, 0, 0, 1]))
+        self.assertEqual((d["command_name"], d["session_id"]), ("DownloadMultiFileFinished", 1))
 
 
 class TestHeader(unittest.TestCase):
