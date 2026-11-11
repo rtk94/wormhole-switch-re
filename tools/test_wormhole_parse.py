@@ -1047,6 +1047,28 @@ class TestUpipeCdb(unittest.TestCase):
         self.assertTrue(out["candidate_upipe"])
         self.assertFalse(out.get("is_upipe", False))
 
+    def test_d8_other_subcommands_are_control_not_poll(self):
+        # A Windows peer also sends d8 00 05 (8-byte reply) and d8 01 ...
+        # with no data; only d8 00 03 is the 16-byte status poll.
+        for cdb, name in ((bytes.fromhex("d8000500000000000000000000004f54"),
+                           "UPIPE CONTROL (0xD8 00 05)"),
+                          (bytes.fromhex("d8010406400000000400000000004f54"),
+                           "UPIPE CONTROL (0xD8 01 04)")):
+            out = wp.decode_cdb(cdb)
+            self.assertTrue(out["is_upipe"])
+            self.assertEqual(out["upipe_kind"], "control")
+            self.assertEqual(out["name"], name)
+            self.assertNotIn("tx_pending", out)
+        self.assertEqual(wp.decode_cdb(up.build_poll_cdb(5))["upipe_kind"], "poll")
+
+    def test_known_vendor_opcodes_are_named(self):
+        f0 = wp.decode_cdb(bytes.fromhex("f0000000000000000000000000004f54"))
+        self.assertEqual(f0["name"], "VENDOR 0xF0 (GetPhysicalBusType?)")
+        self.assertNotIn("candidate_upipe", f0)
+        e1 = wp.decode_cdb(bytes.fromhex("e1030000008000000100000000004f54"))
+        self.assertEqual(e1["name"], "VENDOR 0xE1 (512-byte read)")
+        self.assertNotIn("candidate_upipe", e1)
+
     def test_transaction_properties(self):
         def txn(cdb):
             return wp.Transaction(bus=5, dev=111, cbw=wp.CbW(
@@ -1155,6 +1177,23 @@ class TestUpipeReassembly(unittest.TestCase):
         self.assertEqual([(c["direction"], c["command_name"]) for c in cmds],
                          [("fetch", "Login"), ("send", "ResponseResult")])
 
+    def test_sender_byte_order_follows_its_login(self):
+        # Mac fetches are big-endian; a Windows (or Linux) sender writes
+        # little-endian, which only the Login says before a field is wrong.
+        f, g = up.Framer(session=1), up.Framer(session=1)
+        fetch = (f.frame(up.encode_login("mac", os_byte=up.OS_MAC))
+                 + f.frame(up.encode_response(0x10, session_id=7, endian=">")))
+        send = (g.frame(up.encode_login("win", os_byte=up.OS_WIN))
+                + g.frame(up.encode_response(0x10, session_id=108, endian="<"))
+                + g.frame(up.encode_download_finished(108, "<")))
+        pkts = (self._packets(fetch, FETCH, True)
+                + self._packets(send, SEND, False, start=100, tag0=50))
+        cmds = wp.reassemble_upipe(wp.parse_transactions(pkts))
+        got = [(c["direction"], c["command_name"], c.get("session_id")) for c in cmds]
+        self.assertEqual(got, [("fetch", "Login", None), ("fetch", "ResponseResult", 7),
+                               ("send", "Login", None), ("send", "ResponseResult", 108),
+                               ("send", "DownloadMultiFileFinished", 108)])
+
     def test_failed_send_is_not_counted(self):
         # A send rejected with CHECK CONDITION (no fetching peer) is
         # retried by the sender; the rejected copy carries nothing.
@@ -1188,7 +1227,7 @@ class TestUpipeSummaryAndCli(unittest.TestCase):
             duration=0.0, first_ts=pkts[0].ts))
         dev = summary["devices"]["5:111"]
         self.assertEqual(dev["upipe_packets"],
-                         {"poll": 3, "fetch": 2, "send": 0})
+                         {"poll": 3, "fetch": 2, "send": 0, "control": 0})
         self.assertEqual(dev["candidate_upipe_packets"], 1)
         self.assertEqual(dev["vendor_hid_packets"], 0)
         self.assertEqual(summary["total_upipe_packets"], 5)

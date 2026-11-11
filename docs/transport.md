@@ -193,16 +193,18 @@ runbook in `docs/reproduction.md` §6):
   `valid_hid_framing`.  Summary counts are in `vendor_hid_packets` /
   `vendor_hid_types` per device and `total_vendor_hid_packets`
   overall.
-- **UPipe (`0xD8`, `0xD9 0x28`/`0x2A`):** reported as `UPIPE POLL`,
+- **UPipe (`0xD8`, `0xD9 0x28`/`0x2A`):** reported as `UPIPE POLL`
+  (`d8 00 03` only), `UPIPE CONTROL` (other `0xD8`, seen from Windows),
   `UPIPE FETCH` and `UPIPE SEND` with `is_upipe`/`upipe_kind`, never as
   HID.  The poll reply decodes to `upipe_status` (state, packets
   waiting), each 64 KiB packet to `upipe_chunk` (seq, session, chunk
   index/total, length, `tail_ok`, `terminator`).  Chunks are
   reassembled per device and direction into `upipe_commands`, decoded
   by `tools/upipe_peer.py` (`docs/upipe-protocol.md`); sends the cable
-  rejected are skipped.  Summary counts are in `upipe_packets`.  Other
-  CDBs in the SPC vendor range (`0xC0`–`0xFF`) are flagged
-  `candidate_upipe` with raw hex.
+  rejected are skipped.  Summary counts are in `upipe_packets`.
+  `0xF0` and `0xE1` are named (`docs/upipe-protocol.md`); other CDBs in
+  the SPC vendor range (`0xC0`–`0xFF`) are flagged `candidate_upipe`
+  with raw hex.
 - **Cable → host (interrupt):** interrupt IN COMPLETEs on EP3 are
   decoded as boot-mouse reports (byte 0 buttons, bytes 1–3 signed
   X/Y/wheel) and EP4 as boot-keyboard reports (byte 0 modifiers,
