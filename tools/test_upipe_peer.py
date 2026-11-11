@@ -769,5 +769,122 @@ class TestHeader(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(u.SgIoHdr), 88)
 
 
+class TestFileOps(unittest.TestCase):
+    """Move to Trash, rename and remove from Wormhole.app's remote browser."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "share")
+        self.trash = os.path.join(self.tmp.name, "Trash")
+        os.makedirs(os.path.join(self.root, "dir", "deeper"))
+        for name in ("a.txt", "b.txt", os.path.join("dir", "inner.txt")):
+            with open(os.path.join(self.root, name), "w") as f:
+                f.write(name)
+        self.outside = os.path.join(self.tmp.name, "outside.txt")
+        with open(self.outside, "w") as f:
+            f.write("keep")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def p(self, *parts):
+        return os.path.join(self.root, *parts)
+
+    def replies(self, cmd):
+        return u.server_replies(cmd, [self.root], u.FileResolver({}, [self.root]),
+                                trash=self.trash)
+
+    def test_delete_file_roundtrip(self):
+        cmd = u.encode_delete(0x08, 7, "/home/user/x.txt")
+        self.assertEqual(cmd[:7], bytes([0x08, 0, 0, 0, 7, 0, 34]))   # 16 chars + NUL, UTF-16BE
+        self.assertEqual(u.decode_delete(cmd), {"session_id": 7, "path": "/home/user/x.txt"})
+        self.assertEqual(u.describe_command(cmd)["command_name"], "DeleteFile")
+        self.assertEqual(u.describe_command(cmd)["path"], "/home/user/x.txt")
+
+    def test_delete_directory_roundtrip(self):
+        cmd = u.encode_delete(0x06, 1, "/home/user/d")
+        self.assertEqual(u.decode_delete(cmd)["path"], "/home/user/d")
+        self.assertEqual(u.describe_command(cmd)["command_name"], "DeleteDirectory")
+
+    def test_rename_roundtrip(self):
+        cmd = u.encode_rename(3, "/s/old.txt", "/s/new.txt")
+        # <session u32> <oldLen u16> <newLen u16> <old> <new>
+        self.assertEqual(cmd[:9], bytes([0x09, 0, 0, 0, 3, 0, 22, 0, 22]))
+        self.assertEqual(u.decode_rename(cmd), {"session_id": 3, "path": "/s/old.txt",
+                                                "new_path": "/s/new.txt"})
+        self.assertEqual(u.describe_command(cmd)["new_path"], "/s/new.txt")
+
+    def test_delete_file_moves_it_to_the_trash(self):
+        replies = self.replies(u.encode_delete(0x08, 1, self.p("a.txt")))
+        self.assertEqual([(c[:3], why) for c, why in replies],
+                         [(bytes([0xA1, 0x08, 0]), "delete")])
+        self.assertFalse(os.path.exists(self.p("a.txt")))
+        with open(os.path.join(self.trash, "files", "a.txt")) as f:
+            self.assertEqual(f.read(), "a.txt")
+        with open(os.path.join(self.trash, "info", "a.txt.trashinfo")) as f:
+            info = f.read()
+        self.assertIn("[Trash Info]\nPath=" + self.p("a.txt").replace(" ", "%20"), info)
+        self.assertIn("DeletionDate=", info)
+
+    def test_trash_names_do_not_collide(self):
+        self.replies(u.encode_delete(0x08, 1, self.p("a.txt")))
+        with open(self.p("a.txt"), "w") as f:
+            f.write("second")
+        self.replies(u.encode_delete(0x08, 2, self.p("a.txt")))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.trash, "files"))),
+                         ["a.2.txt", "a.txt"])
+
+    def test_delete_directory_moves_the_tree(self):
+        replies = self.replies(u.encode_delete(0x06, 1, self.p("dir")))
+        self.assertEqual(replies[0][0][:3], bytes([0xA1, 0x06, 0]))
+        self.assertFalse(os.path.exists(self.p("dir")))
+        self.assertTrue(os.path.isfile(os.path.join(self.trash, "files", "dir", "inner.txt")))
+
+    def test_delete_refused_outside_share_and_for_the_share_itself(self):
+        for target in (self.outside, self.root, self.p("missing.txt")):
+            replies = self.replies(u.encode_delete(0x08, 1, target))
+            self.assertEqual(replies[0][0][:3], bytes([0xA1, 0x08, 1]), target)
+        self.assertTrue(os.path.exists(self.outside))
+        self.assertTrue(os.path.isdir(self.root))
+
+    def test_delete_symlink_trashes_the_link_not_its_target(self):
+        os.symlink(self.outside, self.p("link"))
+        replies = self.replies(u.encode_delete(0x08, 1, self.p("link")))
+        self.assertEqual(replies[0][0][:3], bytes([0xA1, 0x08, 0]))
+        self.assertFalse(os.path.lexists(self.p("link")))
+        self.assertTrue(os.path.islink(os.path.join(self.trash, "files", "link")))
+        with open(self.outside) as f:
+            self.assertEqual(f.read(), "keep")
+
+    def test_rename_inside_share(self):
+        replies = self.replies(u.encode_rename(1, self.p("a.txt"), self.p("c.txt")))
+        self.assertEqual([(c[:3], why) for c, why in replies],
+                         [(bytes([0xA1, 0x09, 0]), "rename")])
+        self.assertFalse(os.path.exists(self.p("a.txt")))
+        with open(self.p("c.txt")) as f:
+            self.assertEqual(f.read(), "a.txt")
+
+    def test_rename_refusals(self):
+        cases = [(self.p("a.txt"), self.p("b.txt")),                    # target exists
+                 (self.p("missing.txt"), self.p("c.txt")),              # no source
+                 (self.p("a.txt"), os.path.join(self.tmp.name, "c")),   # out of the share
+                 (self.outside, self.p("c.txt")),                       # from outside
+                 (self.root, self.p("renamed_root"))]                   # the share itself
+        for old, new in cases:
+            replies = self.replies(u.encode_rename(1, old, new))
+            self.assertEqual(replies[0][0][:3], bytes([0xA1, 0x09, 1]), (old, new))
+            err = u.decode_response(replies[0][0], "<")
+            self.assertEqual(err["error_code"], u.REMOTE_OPERATION_ERROR)
+        with open(self.p("b.txt")) as f:
+            self.assertEqual(f.read(), "b.txt")
+        self.assertTrue(os.path.exists(self.p("a.txt")))
+
+    def test_not_served_without_share(self):
+        cmd = u.encode_delete(0x08, 1, self.p("a.txt"))
+        self.assertEqual(u.server_replies(cmd, [], u.FileResolver({}, []), trash=self.trash), [])
+        self.assertTrue(os.path.exists(self.p("a.txt")))
+
+
 if __name__ == "__main__":
     unittest.main()
