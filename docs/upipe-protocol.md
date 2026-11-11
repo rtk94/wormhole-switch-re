@@ -283,10 +283,11 @@ Serving from Linux (`--offer`), little-endian replies in the order above
 were accepted: the Mac logs `Client commandID: A1`, `ResponseResult(0xa1)
 {_RequestCommand:16, _RequestResult:0, …}`, `A3`, `A7`, `multi download
 finish: <session>` and `[Download]Did download N files`. After an `0xa9` it
-keeps the files that arrived, logs `Did download 1 files` and drops the
-session; no dialog appears. A request left unanswered gets no timeout,
-error or dialog in the 4 minutes watched; the next paste starts a new
-session.
+keeps the files that arrived, logs `Did download 1 files`, drops the
+session, and Wormhole.app shows a `Warning` dialog: `Fail to copy file
+"<path>"!` with the path from the `0xa9`'s file. A request left unanswered
+gets no timeout, error or dialog in the 4 minutes watched; the next paste
+starts a new session.
 
 ## Linux peer: `tools/upipe_peer.py`
 
@@ -337,7 +338,7 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `offer` (`--offer`, no serving yet) | Finder paste on the Mac (AppleScript `keystroke "v"` over ssh) leads to a 171-byte big-endian `0x10` (session 101, file ID 101, the offered path plus a NUL, no destination). The Mac then logs `The dummy file has not yet been copied, wait a moment...` 7 times at 0.5 s intervals (`nTimeout` 0–6, the same on every later paste, served or not) and nothing more for session 101 |
 | `serve` (`--offer`, Mac-style `/\…` path) | ResponseResult, one 300 017-byte `0xa3`, `0xa7`, all little-endian; the Mac logs `multi download finish: 102`. The pasted file's SHA-256 matches, but its name is the whole `\home\…\wh_serve_test.bin` path |
 | `serve…big` (`--offer`, POSIX path, 20 MiB random file) | Named `wh_big.bin`. Three `0xa3` (8, 8, 4 MiB), `0xa7`; 338 sends, none failed, about 1.1 s from the request to the last send (~18 MB/s). SHA-256 matches |
-| `serve…err` (`--offer` two files, the second deleted before the paste) | One 315-byte `0x10` for both (session 104, file IDs 104/105). ResponseResult, `0xa3` for the first, `0xa9` (code 6) for the second. The Mac keeps the first file (SHA-256 matches), logs `Did download 1 files`, removes the session; no dialog |
+| `serve…err` (`--offer` two files, the second deleted before the paste) | One 315-byte `0x10` for both (session 104, file IDs 104/105). ResponseResult, `0xa3` for the first, `0xa9` (code 6) for the second. The Mac keeps the first file (SHA-256 matches), logs `Did download 1 files`, removes the session; Wormhole.app shows `Fail to copy file "…/wh_gone.bin"!` |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
