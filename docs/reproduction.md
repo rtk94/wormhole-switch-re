@@ -185,7 +185,7 @@ python3 tools/wormhole_parse.py captures/wormhole_bus3_live_*.pcap --json | less
 | Signal | Where | Meaning |
 |---|---|---|
 | Bulk CBW with CDB opcode `0xD9`, byte 1 `3/4/6`, footer `OT` | Bulk-Only transactions, `vendorHID` column | Host → cable HID packet (`OTi_SendHIDPacket`). Parser decodes type/payload in the `vendorHID` tail. |
-| Bulk CBW with `0xD8` (16 B in) or `0xD9 0x28`/`0x2A` (64 KiB) | `candidateUPipe` flag, or `0xD9` with an unknown type | UPipe poll / fetch / send (file and clipboard channel). The parser does not decode these yet (#8); see `docs/upipe-protocol.md`, whose `tools/upipe_peer.py` is the easier way to drive and log UPipe traffic. |
+| Bulk CBW with `0xD8` (16 B in) or `0xD9 0x28`/`0x2A` (64 KiB) | `UPipe: poll / fetch / send` counts and the `UPipe commands` section | UPipe poll / fetch / send (file and clipboard channel), decoded by the parser since #8; see `docs/upipe-protocol.md`, whose `tools/upipe_peer.py` is the easier way to drive and log UPipe traffic. |
 | Interrupt IN on EP3 (mouse) / EP4 (keyboard) for the Wormhole `Bus:Dev` | `HID interrupt reports` section | Cable → host replay of the peer's input. EP3: 4-byte mouse (buttons/X/Y/wheel); EP4: 8-byte keyboard (modifiers + 6 keys). |
 | Only `GET EVENT STATUS NOTIFICATION`/`REQUEST SENSE` pairs, zero of the above | Same sections empty | No session was driven — check that GoBridge is running on both ends and the switch hotkey matched. |
 
@@ -232,3 +232,102 @@ sudo sg_raw -C 1 /dev/sgX $CDB6
 For a logged, four-phase version of the peer-to-local test (sg_raw and a direct SG_IO call, plus a 15-byte control), see `tools/peer_rerun_send.py`. It needs write access to the `/dev/sgN` node. Results: `docs/live-capture-2026-11-06.md`, re-run section.
 
 Record what you see when you do this — the peer-to-peer data channel is internal, so local capture can only show its HID/SCSI *effects*.
+
+### 6.6 Windows peer in a VM (KVM/libvirt)
+
+A Windows guest can be the Windows peer for v0.5. With USB host
+passthrough, QEMU drives the Wormhole through the Linux host's USB stack
+(usbfs), so `usbmon` on the Linux host records everything the Windows
+software sends and receives.  No capture tool is needed inside Windows, and
+`filter_usbmon.py` / `wormhole_parse.py` work unchanged.
+
+Use libvirt's `<hostdev>` passthrough, not SPICE USB redirection
+(`spicevmc`): redirection relays the traffic through the SPICE client,
+which adds latency and does not survive a re-enumeration.  The guest needs
+an xHCI controller (`qemu-xhci`, the virt-manager default for Windows 11).
+
+```sh
+cat > wormhole-hostdev.xml <<'EOF'
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source startupPolicy='optional'>
+    <vendor id='0x0711'/>
+    <product id='0x2211'/>
+  </source>
+</hostdev>
+EOF
+virsh -c qemu:///system dumpxml --inactive WIN_VM > WIN_VM.before.xml   # backup
+virsh -c qemu:///system attach-device WIN_VM wormhole-hostdev.xml --config
+# undo: virsh -c qemu:///system detach-device WIN_VM wormhole-hostdev.xml --config
+```
+
+`startupPolicy='optional'` lets the VM boot when the cable is unplugged.
+While the VM runs, libvirt unbinds the host drivers from the Wormhole
+(`managed='yes'`), so Linux cannot use that end; `lsusb` still lists it and
+`usbmon` still sees its traffic.
+
+1. Start the capture on the Wormhole's bus **before** starting the VM, so
+   the Windows enumeration and its first SCSI commands are recorded:
+
+   ```sh
+   lsusb -d 0711:2211    # Bus N
+   RAW=~/wormhole-private/raw-captures/wormhole_busN_win_$(date +%F).pcap
+   sudo tcpdump -i usbmonN -w "$RAW" &
+   virsh -c qemu:///system start WIN_VM
+   ```
+
+2. In Windows, open the `WORMHOLE` CD drive and run `SKLoader.exe` by
+   hand: Windows 11 does not run `autorun.inf`.  Note any SmartScreen or
+   UAC prompt; whether the loader needs elevation is not yet recorded.
+   The install writes out the Windows binaries that `GSDD.zz` keeps
+   encrypted (`docs/gsdd.md` § What remains): record the install path and
+   hash them, but publish hashes only (#48).
+3. On the peer (a Mac, as in §6.3), run Wormhole.app and drive the same
+   sequence as §6.3, then the Windows-only clipboard formats: an image
+   copied from Paint (DIB), formatted text from WordPad (RTF), a selection
+   from a browser (HTML), and several images at once.  Repeat in both
+   directions.
+4. Stop and filter.  QEMU resets the device when it attaches, so check the
+   device table: if the Wormhole shows up under more than one `Bus:Dev`,
+   keep each one (`--device` is repeatable).
+
+   ```sh
+   sudo pkill tcpdump
+   python3 tools/wormhole_parse.py "$RAW" --all --no-transactions   # device table
+   python3 tools/filter_usbmon.py "$RAW" --device N:D -o captures/wormhole_busN_win_$(date +%F).pcap
+   python3 tools/wormhole_parse.py captures/wormhole_busN_win_*.pcap --hid
+   ```
+
+Like the UPipe captures in `docs/upipe-protocol.md`, a session with a
+logged-in peer carries the host name in the Login packet: keep it private
+unless the guest's host name is one you are happy to publish.
+
+#### Both ends on one Linux host (two-end capture, #14)
+
+Plugging both ends into the Linux host, one passed to the Windows guest and
+the other used by `tools/upipe_peer.py` on Linux, puts both sides of the
+cable in one `usbmon` capture on one clock, which is the two-end capture
+#14 asks for.  Use the host timestamps for turnaround: they are taken at
+the host controller, where the cable sees the traffic, and do not include
+the guest's scheduling delay.
+
+Not yet tried: whether both ends enumerate as `0711:2211` at once on one
+host.  If they do, the vendor/product `<hostdev>` above matches both and
+libvirt cannot choose.  Remove it (the `detach-device --config` line) and
+attach one end to the running guest by `Bus:Dev` instead:
+
+```sh
+lsusb -d 0711:2211      # two entries; unplug one to tell the ends apart
+cat > wormhole-end.xml <<'EOF'
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <address bus='5' device='111'/>
+  </source>
+</hostdev>
+EOF
+virsh -c qemu:///system attach-device WIN_VM wormhole-end.xml --live
+```
+
+`Bus:Dev` changes when the end re-enumerates, so re-run `lsusb` and
+re-attach after any replug.  If both ends sit on the same bus, one
+`tcpdump -i usbmonN` records both; otherwise capture `usbmon0` (all
+buses) and filter to both `Bus:Dev` pairs.
