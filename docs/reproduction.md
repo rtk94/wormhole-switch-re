@@ -294,6 +294,23 @@ While the VM runs, libvirt unbinds the host drivers from the Wormhole
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\windows_capture.ps1          # -List shows the steps, -From <id> resumes
    ```
+
+   Keyboard and mouse sharing needs the pointer to hit the Windows screen
+   edge.  With libvirt's default USB tablet (absolute pointer) it leaves the
+   viewer window instead, so remove the tablet; the viewer then grabs the
+   pointer on a click (Ctrl+Alt releases it):
+
+   ```sh
+   printf "<input type='tablet' bus='usb'>\n  <address type='usb' bus='0' port='1'/>\n</input>\n" > tablet.xml
+   virsh -c qemu:///system detach-device WIN_VM tablet.xml --live --config
+   # undo: virsh -c qemu:///system attach-device WIN_VM tablet.xml --live --config
+   ```
+
+   `-Plan followup` runs the second session: the Wormhole settings
+   (screenshots), keyboard and mouse both ways with a cursor trace, the
+   Mac → Windows file paste step by step, the remote browser, and drag and
+   drop.  It writes `markers_followup.jsonl`, `results_followup.json` and
+   `shots\followup_*.png`.
 4. Stop and filter.  QEMU resets the device when it attaches, so check the
    device table: if the Wormhole shows up under more than one `Bus:Dev`,
    keep each one (`--device` is repeatable).
