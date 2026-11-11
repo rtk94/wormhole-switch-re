@@ -6,7 +6,8 @@
 - How a 64 KiB OTi packet is framed (integrity tail, chunk header, end-of-command terminator)
 - How GoBridge commands are encoded, with Login (`0x01`) and ResponseResult (`0xA1`) in full
 - How to stand in for a GoBridge peer from Linux with `tools/upipe_peer.py`
-- What is still unknown (file/clipboard command payloads, the `0xF0` CDB, `DUMMY_DATA`)
+- What the clipboard push (`0x39` XmlPacket) looks like for text and files
+- What is still unknown (file contents transfer, drag-and-drop, the `0xF0` CDB, `DUMMY_DATA`)
 
 The HID injection path (`0xD9 '3'/'4'/'6'` CDBs with no data phase) is a
 separate mechanism, covered in [transport.md](transport.md#peer-link-vendor-scsi-cdb-packets-host--cable)
@@ -113,8 +114,8 @@ IDs known to `CommandDataBuffer commandClassForCommandID:`: `0x00` (dummy),
 operations listed in [mac-gobridge.md](mac-gobridge.md#file-transfer-command-surface-objc-selectors).
 Client side (`THMGBClient`) handles `0xa1`–`0xa9` and `0xad`, starting with
 `0xa1` ResponseResult. `0x39` is `XmlPacketCommand`; `OTiCommand doCommand:`
-drops it while the server is not connected. Payloads other than Login and
-ResponseResult are not decoded yet.
+drops it while the server is not connected. Login, ResponseResult and the
+clipboard form of XmlPacket are decoded below; other payloads are not.
 
 ### OS byte
 
@@ -127,7 +128,9 @@ High nibble = type, low nibble = version (`GB_OS_TYPE_MASK 0xf0`,
 | Mac | `0x10` | `OS_MACOS_10_0` 0 … `OS_MACOS_10_8` 8 |
 | Linux | `0x20` | — |
 
-OS X 10.6.8 sends `0x16`.
+OS X 10.6.8 sends `0x16`. The constant for `0x20` is named Linux, and the
+daemon logs `remote is linux`, but the Mac's Wormhole Switch window labels a
+`0x20` peer "Android" (`Remote Computer: Android linux-peer`, 2026-11-11).
 
 ### Login (`0x01`)
 
@@ -167,6 +170,49 @@ Both sides are client and server at once:
 3. On a Linux peer the Mac logs `remote is linux` and skips
    `forwardDomainFoldersInfoToRemote`, which Windows and Mac peers receive.
 
+### XmlPacket (`0x39`): clipboard
+
+```
+39 <xml length BE32> <xml, UTF-8, no terminator>
+```
+
+The Mac pushes the clipboard to a logged-in peer as soon as it changes
+(`ClipboardHandler` → `sendCBUPipeMessage`); nothing is requested first.
+The XML is one line; indented here:
+
+```xml
+<ExtraXmlCommand>HookAppService</ExtraXmlCommand>
+<ExtraXmlParam><OTIMSG>
+  <Param_Clipboard_Info_2><OTIMSG>
+    <CP_Content>…</CP_Content>            <!-- text: hex of UTF-16LE, NUL-terminated -->
+    <NodeInfoList><Line><NodeInfo>…</NodeInfo></Line>…</NodeInfoList>  <!-- files -->
+    <CB_Format_Type>CB_Format_Text | CB_Format_File</CB_Format_Type>
+  </OTIMSG></Param_Clipboard_Info_2>
+  <NP_Cmd>Cmd_Transfer_Clipboard</NP_Cmd>
+  <NP_Up_Notice_NamePipe_Name>\\.\pipe\OTI_ClipboardAgent</NP_Up_Notice_NamePipe_Name>
+</OTIMSG></ExtraXmlParam>
+```
+
+- Text: `CP_Content` is uppercase hex of the UTF-16LE string including its
+  NUL. The Mac reads `public.utf8-plain-text` and converts.
+- Files (Finder copy): one `NodeInfo` per file, uppercase hex of an
+  824-byte record:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 260 | path, 8-bit, NUL-padded (`MAX_PATH`); Mac paths are written `/\Users\…` |
+  | 260 | 520 | same path, UTF-16LE, NUL-padded |
+  | 780 | 3 × 8 | FILETIMEs; observed creation, last access, last write (order inferred from values) |
+  | 804 | 4 | size high (observed 0) |
+  | 808 | 4 | size low (observed 91 713 for a 91.7 KB `.jpg`) |
+  | 812 | 12 | zero in the one sample; meaning unconfirmed |
+
+  This carries metadata only. How the receiver pulls the file contents on
+  paste (presumably the `0x04`… file commands) is not captured yet.
+- The named-pipe name and `HookAppService` are Windows clipboard-agent
+  routing, sent unchanged by the Mac.
+- The Linux tool sends no reply and the Mac does not wait for one.
+
 ## Linux peer: `tools/upipe_peer.py`
 
 Stdlib only (SG_IO via ctypes). `/dev/sgN` must be the cable's generic node
@@ -197,6 +243,7 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | Mac alone (nothing fetching on Linux) | Mac's 13 send attempts all fail with sense key 9 / ASC `0x85`; its polls still read `0x07` (why, with no Linux poller, is unexplained) |
 | `macpeer` (receive only) | Linux polls → state `0x07`, then `0x05` with 2 waiting; fetches Login (seq 2, session 2) and a terminator. Both 64 KiB packets match the Mac's dtrace data-out buffers byte for byte. The Mac logs `login to remote with name: …`, `Send command: 1` and waits |
 | `login` (`--login linux-peer`) | Mac's Login (seq 3, session 3) arrives; Linux queues ResponseResult + its own Login (4 packets); all 4 sends succeed; the Mac fetches all 4, logs `ResponseResult(0xa1) {_RequestCommand:1, _RequestResult:0, …}`, `did login to remote`, `[Login Command] Os Type:20 ,name: linux-peer`, `remote has login`, `remote is linux`, and replies with its own 44-byte ResponseResult (OS `0x16`). Wormhole.app logs `remoteDidLoginWithName linux-peer, os: 32` |
+| `xfer` (`--login`, then user actions on the Mac) | Same handshake. Copying text sends a 587-byte XmlPacket (`CB_Format_Text`, seq 7); copying a `.jpg` in Finder sends a 2 049-byte one (`CB_Format_File`, one `NodeInfo`, seq 8). Dragging a file toward the Linux side sent nothing: the Mac logs `DragDrop getScreenFrame` and later `Clear the dragdropboard contents`. The Mac logged only these two pasteboard changes (`changeCount` 1 and 2). 39 061 polls, no send errors |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
 `tools/filter_usbmon.py` (19 830 records, sha256 `11b0da0e…`), shows
@@ -209,9 +256,12 @@ because they contain the Mac's host name.
 
 ## Open questions
 
-- File, clipboard and XML (`0x39`) command payloads. Next step: run
-  `--login` while copying text or dragging a file on the Mac, and try
-  `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.
+- File contents: how a receiver fetches a copied file (`NodeInfo` gives
+  only metadata), and what drag-and-drop needs from the peer (likely the
+  mouse/KM side; the Mac abandoned the drag). Next step: answer with Linux
+  file requests, or capture a Windows peer pasting.
+- Image clipboard formats (only text and file seen).
+- `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
 - `remoteIsBigEndian` rule (affects how the Mac decodes our big-endian fields).
 - Windows peer parity: the same commands are expected but not yet captured.
