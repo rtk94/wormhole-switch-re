@@ -193,8 +193,9 @@ runbook in `docs/reproduction.md` §6):
   `valid_hid_framing`.  Summary counts are in `vendor_hid_packets` /
   `vendor_hid_types` per device and `total_vendor_hid_packets`
   overall.  Non-`0xD9` CDBs in the SPC vendor range (`0xC0`–`0xFF`)
-  are flagged `candidate_upipe` with raw hex so a UPipe / file /
-  clipboard packet can be characterised from a live capture.
+  are flagged `candidate_upipe` with raw hex.  The parser predates the
+  UPipe decode, so it flags the `0xD8` poll and treats `0xD9 0x28`/`0x2A`
+  as malformed HID (#8).
 - **Cable → host (interrupt):** interrupt IN COMPLETEs on EP3 are
   decoded as boot-mouse reports (byte 0 buttons, bytes 1–3 signed
   X/Y/wheel) and EP4 as boot-keyboard reports (byte 0 modifiers,

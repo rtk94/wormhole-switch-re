@@ -313,8 +313,9 @@ The `macpeer` usbmon capture, filtered to `5:111` with
 2 928 poll CDBs and 2 fetches. Its fetched data matches the tool's packet
 files. The other 374 SCSI transactions are the kernel's
 `GET EVENT STATUS NOTIFICATION` / `REQUEST SENSE` media polling.
-`tools/wormhole_parse.py` counts the `d8`/`d9 28` CDBs as `candidate UPipe`
-(it does not decode them). Raw captures, packets and Mac logs stay private
+`tools/wormhole_parse.py` counts the 2 928 `d8` polls as `candidate UPipe`
+and reads the `d9 28` fetches as `0xD9` HID with an unknown type; it does
+not decode UPipe yet (#8). Raw captures, packets and Mac logs stay private
 because they contain the Mac's host name.
 
 ## Open questions

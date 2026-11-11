@@ -292,8 +292,9 @@ KMClipboard.dylib  d3e038f4b5c81228f599e889bc23e5c417df7c4484a473e77222b0443d12f
   `PasteboardSynchronize`.
 - Clipboard payloads ride **UPipe messages** (`marshallFromUPipeMsg`),
   i.e. the same peer channel as file commands — not HID packets.
-  Wire framing of UPipe clipboard messages is still unknown (needs a
-  live capture; see Unknowns).
+  On the wire they are `XmlPacket` (`0x39`) commands carrying
+  `Cmd_Transfer_Clipboard` XML: see
+  [upipe-protocol.md](upipe-protocol.md#xmlpacket-0x39-clipboard).
 
 ## FileChgEvent.dylib — Finder paste monitor
 
@@ -311,11 +312,8 @@ check) to trigger file-transfer sessions.
 
 ## Unknowns (narrowed)
 
-- File/clipboard **UPipe** packet magic and framing beyond the HID `D9`
-  format — needs a live peer-active usbmon capture (see
-  `docs/reproduction.md` §6).  `tools/wormhole_parse.py` now decodes
-  `0xD9` HID packets (`decode_vendor_cdb`) and flags any other
-  `0xC0`–`0xFF` CDB as a `candidate_upipe` with raw hex, so the next
-  live capture can characterise the UPipe magic without a new parser.
+- File/clipboard **UPipe**: the SCSI layer, framing, login, clipboard
+  and file download are decoded in [upipe-protocol.md](upipe-protocol.md).
+  Uploads and the other file operations (`0x11`…) are still open (#9).
 - Cable-side forwarding (how the microcontroller routes CDB packets to
   the peer end) is not in host binaries; needs firmware or two-end capture.

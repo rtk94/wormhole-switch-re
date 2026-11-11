@@ -56,7 +56,8 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
 │   ├── 15-byte-cdb-truncation.md # short vendor CDBs in the original run (#16)
 │   ├── issue-15-mouse60-orphan.md # bus3 x=+60 report findings (#15)
 │   ├── issue-17-sanitise-history.md # capture sanitisation record (#17)
-│   ├── protocol-mouse-upipe.md   # vendor HID and UPipe protocol notes
+│   ├── protocol-mouse-upipe.md   # vendor HID notes (UPipe section superseded by upipe-protocol.md)
+│   ├── upipe-protocol.md         # UPipe peer channel: SCSI poll/fetch/send, framing, commands (#7)
 │   ├── gsdd.md                   # GSDD container format (#10)
 │   ├── wormhole-app-ui.md        # macOS Wormhole.app UI analysis (#12)
 │   ├── methodology.md            # REA device-protocol workflow used
@@ -81,7 +82,10 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
     ├── filter_usbmon.py          # keep one device's records from a raw usbmon pcap (sanitising)
     ├── test_filter_usbmon.py     # unittest suite for the filter (9 tests)
     ├── peer_rerun_send.py        # logged send driver for the peer->local re-run (sg_raw and SG_IO)
-    └── test_peer_rerun_send.py   # unittest suite for the driver (4 tests)
+    ├── test_peer_rerun_send.py   # unittest suite for the driver (4 tests)
+    ├── upipe_peer.py             # Linux UPipe peer: login, clipboard push, file download (SG_IO)
+    ├── test_upipe_peer.py        # unittest suite for the peer (38 tests)
+    └── gobridge_scsi.d           # dtrace tracer for GoBridgeDemon's SCSI tasks (macOS)
 ```
 
 ## Reproduce the basics
@@ -107,8 +111,9 @@ does not depend on a Bus:Device number from a previous plug.  It also
 decodes the Wormhole vendor HID protocol (16-byte `0xD9` CDB,
 `D9 '3'/'4'/'6' <12 payload> O T` — see `docs/transport.md`) and boot
 HID interrupt reports (EP3 mouse, EP4 keyboard), and flags any other
-vendor-range CDB as a candidate UPipe packet so a live peer-active
-capture is parseable immediately:
+vendor-range CDB as a candidate UPipe packet.  It does not decode UPipe
+yet (#8); the UPipe format and a Linux peer are in
+`docs/upipe-protocol.md`:
 
 ```sh
 python3 tools/wormhole_parse.py captures/wormhole_bus3_2026-11-06.pcap
@@ -117,6 +122,7 @@ python3 tools/wormhole_parse.py live.pcap --hid   # peer-active capture
 python3 -m unittest tools.test_wormhole_parse
 python3 -m unittest tools.test_filter_usbmon
 python3 -m unittest tools.test_peer_rerun_send
+python3 -m unittest tools.test_upipe_peer
 ```
 
 For the live peer-active capture runbook (idle baseline, GoBridge
