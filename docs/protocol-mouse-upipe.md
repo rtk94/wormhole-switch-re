@@ -218,6 +218,10 @@ anywhere.
 
 ## 3. UPipe / File-Transfer Framing: `GetData` / `PutData` Queues
 
+> **Superseded (2026-11-11).** The UPipe channel has been captured and
+> decoded; see [upipe-protocol.md](upipe-protocol.md). This section keeps
+> the pre-capture static analysis. §3.3 below lists what was observed.
+
 ### 3.1 What we know from static analysis
 
 `OTiTransporter` (C++, ~70 methods) exposes:
@@ -240,7 +244,11 @@ VENDOR_RANGE = (0xC0, 0xFF)        # SPC vendor-specific opcodes
 VENDOR_HID_MAGIC = 0xD9            # Only 0xD9 is fully decoded
 ```
 
-Any CDB with opcode `0xC0–0xFF` **except 0xD9** is reported as:
+Any CDB with opcode `0xC0–0xFF` **except 0xD9** is reported as the
+following. This predates the capture: real UPipe traffic uses `0xD8`
+and `0xD9`, so the parser flags the `0xD8` poll as a candidate and
+reads `0xD9 0x28`/`0x2A` as malformed HID (#8).
+
 
 ```json
 {
@@ -253,16 +261,17 @@ Any CDB with opcode `0xC0–0xFF` **except 0xD9** is reported as:
 }
 ```
 
-### 3.3 Observed UPipe candidate structure (from live captures needed)
+### 3.3 Observed UPipe structure (2026-11-11)
 
-| Field | Status |
-|-------|--------|
-| CDB opcode | Unknown (0xC0–0xFF, ≠0xD9) |
-| CDB length | Likely 16 bytes (same SCSI transport) |
-| Magic bytes | Unknown — **needs live peer-active capture** |
-| Data phase | Present (CBW `data_len` > 0, bulk IN/OUT follows) |
-| Direction | Both: host→cable (PutData/upload) and cable→host (GetData/download) |
-| Queueing | `THMFileManager` maintains `rxQueues` / `txQueue` per session ID |
+| Field | Observed |
+|-------|----------|
+| CDB opcodes | `0xD8 00 03` status poll (16 B in); `0xD9 0x28 0x64` fetch (64 KiB in); `0xD9 0x2A 0xFF` send (64 KiB out) |
+| CDB length | 16 bytes, `O` `T` footer as for HID |
+| Packet | `0xffec`-byte body + its first 20 bytes as a tail; chunk header of five little-endian `u32`s |
+| Direction | Both ends poll the cable; each fetches what the other sent |
+| Commands | Byte 0 = GoBridge command ID (Login `0x01`, XmlPacket `0x39`, DownloadMultipleFile `0x10`, ResponseResult `0xa1`, …) |
+
+Details and evidence: [upipe-protocol.md](upipe-protocol.md).
 
 ### 3.4 Clipboard rides UPipe, not HID
 
@@ -271,8 +280,8 @@ From `docs/mac-gobridge.md` (KMClipboard.dylib):
 > Clipboard payloads ride **UPipe messages** (`marshallFromUPipeMsg`), i.e. the same peer channel as file commands — not HID packets.
 
 So the UPipe channel multiplexes:
-- File transfer (upload/download, directory ops)
-- Clipboard sync
+- File transfer (upload/download, directory ops); download decoded
+- Clipboard sync; confirmed as `XmlPacket` (`0x39`) carrying `Cmd_Transfer_Clipboard`
 - Possibly hotkey/switch commands (`_NotifyUPipeMesssageUpToAppThread:`)
 
 ---
@@ -335,12 +344,10 @@ Decodes the **interrupt IN report** (EP3, 4 bytes) — same 4-byte layout as CDB
 
 | Unknown | Where to look |
 |---------|---------------|
-| UPipe CDB magic bytes (opcode + payload header) | Any vendor CDB ≠ 0xD9 in a file-transfer session |
-| UPipe command/response encoding | `GetData`/`PutData` queue payloads (bulk data phase) |
-| Clipboard UPipe message format | `marshallFromUPipeMsg` / `unmarshallFromUPipeMsg` in KMClipboard |
-| Cable-side routing (microcontroller firmware) | Not in host binaries; needs two-end capture or firmware dump |
-
-The parser already flags every non-0xD9 vendor CDB as `candidate_upipe` with raw hex — run it on a live transfer capture to characterise the magic.
+| UPipe CDB magic bytes (opcode + payload header) | Resolved: [upipe-protocol.md](upipe-protocol.md#layer-1-scsi-commands) |
+| UPipe command/response encoding | Partly resolved: login, clipboard and download decoded; uploads open (#9) |
+| Clipboard UPipe message format | Resolved: [XmlPacket `0x39`](upipe-protocol.md#xmlpacket-0x39-clipboard) |
+| Cable-side routing (microcontroller firmware) | Not in host binaries; needs two-end capture or firmware dump (#14) |
 
 ---
 

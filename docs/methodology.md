@@ -27,7 +27,7 @@ Followed `reverse-engineer-anything` v49 → `references/device-protocol-analysi
 | `tshark` REA pcap (`inspect_pcap_capture`, `inspect_packet_capture`) | **Done** — `tshark`/`capinfos` 4.4.19 at `/usr/bin/`; `inspect_pcap_client` passes | — |
 | UPX decompression | **Done** — `upx` 4.2.4, `upx -d` 104,488 → 310,312 B; real imports (380) + exports (12) recovered | — |
 | `inspect_macho` | Unavailable on Linux (macOS-only) | Use `open_binary` (Ghidra) or macOS host |
-| Live peer traffic | Not captured — second machine connected but no Wormhole session driven; parser now decodes `0xD9` + HID and flags UPipe candidates (see `docs/reproduction.md` §6) | Run GoBridge on both ends, move mouse/files, re-capture `usbmon3` |
+| Live peer traffic | **Done** — HID sessions captured 2026-11-06 (`docs/live-capture-2026-11-06.md`); UPipe clipboard and file traffic 2026-11-11 with a Linux peer and Mac dtrace (`docs/upipe-protocol.md`) | — |
 
 ## Preservation
 
@@ -37,8 +37,8 @@ Followed `reverse-engineer-anything` v49 → `references/device-protocol-analysi
 
 ## What remains unknown
 
-- `GSDD.zz` / `GSDD.lst` container format (encryption/compression) and their role in SKLoader deployment.
+- Resolved: `GSDD.zz` / `GSDD.lst` container format. See [`gsdd.md`](gsdd.md).
 - Bridge peer-to-peer data channel between the two cable ends (internal to the microcontroller, not enumerated from one host).
 - Resolved: kernel block size (15.5 MiB) exceeds `READ CAPACITY(10)` (3.1 MiB) because Linux `sr` takes `max(READ CAPACITY, last_written)`. See [`capacity-anomaly.md`](capacity-anomaly.md).
-- File/clipboard **UPipe** packet magic and framing beyond the HID `D9` format — needs a live peer-active usbmon capture (see `docs/reproduction.md` §6). `tools/wormhole_parse.py` now has a vendor-CDB decoder (`0xD9` HID + `candidate_upipe` for other `0xC0`–`0xFF` CDBs) so the next capture is immediately parseable; only the UPipe magic itself remains unknown until that capture runs.
+- Mostly resolved: file/clipboard **UPipe** magic, framing, clipboard and file download. See [`upipe-protocol.md`](upipe-protocol.md); uploads and other file operations remain open.
 - Cable-side forwarding (how the microcontroller routes CDB packets to the peer end) is not in host binaries; needs firmware or two-end capture.

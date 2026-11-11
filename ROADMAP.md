@@ -43,15 +43,16 @@ Milestones track the reverse-engineering progression from initial enumeration to
 
 ## 🔄 v0.4 — UPipe protocol (file / clipboard channel) — **CURRENT**
 
-The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and verified end-to-end. Multimedia `'6'` mapped (all-zero probe; inferred `payload[0]` = usage). The **file/clipboard channel** uses the same SCSI Bulk-Only pipe with a different vendor CDB magic (not yet captured).
+The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and verified end-to-end. Multimedia `'6'` mapped (all-zero probe; inferred `payload[0]` = usage). The **file/clipboard channel** uses the same SCSI Bulk-Only pipe: a `0xD8` status poll plus `0xD9 0x28` / `0xD9 0x2A` 64 KiB transfers (`docs/upipe-protocol.md`).
 
-- [ ] Capture live peer-active session with file drag / clipboard copy (both ends running GoBridge/Wormhole) — Linux ↔ macOS link and login handshake captured 2026-11-11 (`docs/upipe-protocol.md`); file/clipboard payloads still to capture
-- [x] Identify UPipe CDB magic byte(s) — `0xD8` poll, `0xD9 0x28` fetch, `0xD9 0x2A` send (`docs/upipe-protocol.md`)
-- [ ] Decode UPipe framing: chunking, sequence, CRC, file metadata, clipboard MIME types — packet tail check, chunk header, terminator, Login/ResponseResult decoded; file and clipboard commands open
-- [ ] Verify bidirectional symmetry (PC A → PC B vs PC B → PC A)
+- [x] Capture live peer-active session with clipboard copy and file transfer — Linux ↔ macOS, 2026-11-11, with `tools/upipe_peer.py` on Linux and `tools/gobridge_scsi.d` (dtrace) on the Mac. No usbmon capture of it is published: the Login packet carries the Mac's host name (#7)
+- [x] Identify UPipe CDB magic byte(s) — `0xD8` poll, `0xD9 0x28` fetch, `0xD9 0x2A` send
+- [ ] Decode UPipe framing and commands — packet tail, chunk header, terminator, Login (`0x01`), ResponseResult (`0xa1`), clipboard XmlPacket (`0x39`: text and file metadata) and file download (`0x10` → `0xa1`/`0xa3`/`0xa7`, `0xa9` on error) decoded; upload, rename, delete and mkdir (`0x11`…), image clipboard formats and `MultipleFilePackage` open (#9)
+- [ ] Verify bidirectional symmetry (PC A → PC B vs PC B → PC A) — clipboard text verified both ways; file download verified Mac → Linux only
+- [ ] `tools/wormhole_parse.py` classifies UPipe CDBs (it still flags `0xD8` as a candidate and reads `0xD9 0x28`/`0x2A` as malformed HID) (#8)
 - [x] Document in `docs/transport.md` (new section) + new `docs/upipe-protocol.md`
 
-**Status:** `tools/upipe_peer.py` stands in for the GoBridge peer on Linux (poll/fetch/send plus the login handshake), and `tools/gobridge_scsi.d` traces the macOS side. Remaining: drive a clipboard copy and a file drag on the Mac with the Linux peer logged in, and decode those commands.
+**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`) and file download from the Mac (`--download`). Remaining: the Mac fetching files from Linux, uploads, and parser support.
 
 ---
 
@@ -70,7 +71,7 @@ macOS GoBridgeDemon is analysed to function level (`docs/mac-gobridge.md`). Wind
 
 ---
 
-## ✅ v0.6 — Firmware mysteries (Partially resolved)
+## 🔄 v0.6 — Firmware mysteries (Partially resolved)
 
 Host-side observations resolved several firmware-adjacent questions without needing a firmware dump:
 
@@ -105,21 +106,20 @@ Host-side observations resolved several firmware-adjacent questions without need
 | v0.1 | Enumeration & topology | ✅ Done | — |
 | v0.2 | SCSI / Mass Storage | ✅ Done | — |
 | v0.3 | ISO payload & host inventory | ✅ Done | — |
-| v0.4 | **UPipe protocol** | 🔄 **In progress** | Next capture |
+| v0.4 | **UPipe protocol** | 🔄 **In progress** | Uploads, Mac → Linux fetch, parser |
 | v0.5 | Windows host parity | 🔄 In progress | After v0.4 |
-| v0.6 | Firmware internals | ✅ Partially resolved | Long-term |
+| v0.6 | Firmware internals | 🔄 Partially resolved | Long-term |
 | v1.0 | Stable reference release | 📋 Planned | When v0.4–0.6 converge |
 
 ---
 
 ## How to move v0.4 forward
 
-1. Set up two machines (Linux + macOS, or Linux + Windows) with the Wormhole cable between them.
-2. Run GoBridge / Wormhole software on both ends.
-3. On the capture host: `sudo tcpdump -i usbmonN -w raw.pcap` (start **before** switching).
-4. Drive a session: mouse moves, clicks, keystrokes, **file drag**, **clipboard copy/paste**.
-5. Stop, filter (`tools/filter_usbmon.py`), parse (`tools/wormhole_parse.py --json`), inspect `candidate_upipe` entries.
-6. Correlate with host-software logs (macOS `GoBridgeDemon` logs `key HID:`; Windows DLL exports may log similarly).
-7. Document the UPipe CDB magic and framing.
+The capture method is in `docs/upipe-protocol.md` (Linux peer tool + Mac dtrace tracer). Remaining steps:
 
-Once UPipe is decoded, v0.4 closes and v0.5/v0.6 can proceed in parallel.
+1. Serve `0x10` DownloadMultipleFile from Linux: push a `CB_Format_File` clipboard entry to the Mac, paste in Finder, and answer the Mac's request.
+2. Decode the upload and file-operation commands (`0x11`…) the same way: decompile, add to `tools/upipe_peer.py`, verify live.
+3. Teach `tools/wormhole_parse.py` the UPipe CDBs (#8).
+4. Repeat against a Windows peer for parity (v0.5).
+
+Once uploads and the parser are done, v0.4 closes.

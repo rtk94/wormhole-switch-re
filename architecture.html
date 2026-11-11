@@ -428,7 +428,7 @@
   <rect x="24" y="624" width="400" height="28" rx="5" fill="rgba(245,158,11,0.10)" stroke="rgba(245,158,11,0.35)" stroke-width="1"/>
   <text x="224" y="642" text-anchor="middle" font-size="8" fill="#fbbf24" class="mono">0xD9 vendor CDB — HID injection (types 3 / 4 / 6)</text>
   <rect x="440" y="624" width="400" height="28" rx="5" fill="rgba(239,68,68,0.08)" stroke="rgba(248,113,113,0.35)" stroke-width="1"/>
-  <text x="640" y="642" text-anchor="middle" font-size="8" fill="#fca5a5" class="mono">UPipe — file &amp; clipboard transfer (magic TBD, #7)</text>
+  <text x="640" y="642" text-anchor="middle" font-size="8" fill="#fca5a5" class="mono">UPipe — file &amp; clipboard (0xD8 poll · 0xD9 28/2A)</text>
   <rect x="856" y="624" width="400" height="28" rx="5" fill="rgba(94,106,210,0.12)" stroke="rgba(113,112,255,0.35)" stroke-width="1"/>
   <text x="1056" y="642" text-anchor="middle" font-size="8" fill="#a5b4fc" class="mono">ISO 9660 — WORMHOLE payload (SKLoader / GoBridgeDemon)</text>
 </svg>
@@ -457,7 +457,7 @@
     <tr><td class="k">Vendor CDB</td><td class="v">0xD9 · 32-byte · 0x80 prefix</td></tr>
     <tr><td class="k">Mouse (type 3)</td><td class="v">btn + dX/dY/dWheel</td></tr>
     <tr><td class="k">Multimedia (type 6)</td><td class="v">consumer usage code</td></tr>
-    <tr><td class="k">UPipe</td><td class="v">vendor CDB, magic TBD (#7)</td></tr>
+    <tr><td class="k">UPipe</td><td class="v">0xD8 poll · 0xD9 0x28 fetch / 0x2A send</td></tr>
     <tr><td class="k">SCSI</td><td class="v">PDT=5 (CD-ROM) · LOG SENSE polling</td></tr>
   </table>
 </div>

@@ -185,7 +185,7 @@ python3 tools/wormhole_parse.py captures/wormhole_bus3_live_*.pcap --json | less
 | Signal | Where | Meaning |
 |---|---|---|
 | Bulk CBW with CDB opcode `0xD9`, byte 1 `3/4/6`, footer `OT` | Bulk-Only transactions, `vendorHID` column | Host → cable HID packet (`OTi_SendHIDPacket`). Parser decodes type/payload in the `vendorHID` tail. |
-| Bulk CBW with any other vendor opcode (`0xC0`–`0xFF`) + data phase | `candidateUPipe` flag | Possible UPipe / file / clipboard packet — magic unknown; capture the raw hex. |
+| Bulk CBW with `0xD8` (16 B in) or `0xD9 0x28`/`0x2A` (64 KiB) | `candidateUPipe` flag, or `0xD9` with an unknown type | UPipe poll / fetch / send (file and clipboard channel). The parser does not decode these yet (#8); see `docs/upipe-protocol.md`, whose `tools/upipe_peer.py` is the easier way to drive and log UPipe traffic. |
 | Interrupt IN on EP3 (mouse) / EP4 (keyboard) for the Wormhole `Bus:Dev` | `HID interrupt reports` section | Cable → host replay of the peer's input. EP3: 4-byte mouse (buttons/X/Y/wheel); EP4: 8-byte keyboard (modifiers + 6 keys). |
 | Only `LOG SENSE`/`REQUEST SENSE` pairs, zero of the above | Same sections empty | No session was driven — check that GoBridge is running on both ends and the switch hotkey matched. |
 
