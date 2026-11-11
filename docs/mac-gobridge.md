@@ -103,6 +103,8 @@ The daemon implements a command protocol over `THMGBServer` /
   `handleDomainFolders:`, `handleUploadMultiFileError`,
   `handleUploadDownloadFinish:`, `handleTransferFailed:`, `handleDriveInfo:`,
   `handleRequestResponse:`, `handleCommand:`.
+- Which command ID and payload reaches each handler, and what was verified
+  on the wire, is in [upipe-protocol.md § Selector map](upipe-protocol.md#selector-map).
 - `THMFileManager` (~200 methods) implements sessions/queues
   (`uploadSessionWithID:`, `downloadSessionWithID:`, `rxQueues`, `txQueue`
   counters), remote XML (`sendXml:`, `receiveSwitchToRemoteXML:`),

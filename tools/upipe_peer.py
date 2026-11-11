@@ -83,6 +83,7 @@ CMD_UPLOAD_FILE_DATA = 0x0C
 CMD_UPLOAD_MULTI = 0x12
 CMD_UPLOAD_CONFIRM = 0x13
 CMD_UPLOAD_ABORT = 0x14
+CMD_UPLOAD_ZERO = 0x15
 CMD_UPLOAD_CONFIRMATION = 0xA8
 CMD_DIRECTORY_INFO = 0xA2
 CMD_DOWNLOAD_MULTI = 0x10
@@ -701,7 +702,7 @@ def describe_command(cmd, endian=">"):
             out.update(decode_rename(cmd, endian))
         elif cmd[0] == CMD_UPLOAD_CONFIRM:
             out.update(decode_upload_files(cmd, endian))
-        elif cmd[0] == CMD_UPLOAD_MULTI:
+        elif cmd[0] in (CMD_UPLOAD_MULTI, CMD_UPLOAD_ZERO):
             out.update(decode_upload_multi(cmd, endian))
         elif cmd[0] == CMD_UPLOAD_FILE_DATA and len(cmd) >= FILE_DATA_HEADER:
             out.update(zip(("file_id", "total", "index", "data_length"),
@@ -1049,9 +1050,10 @@ def decode_upload_files(cmd, endian=">"):
 
 
 def decode_upload_multi(cmd, endian=">"):
-    """UploadMultipleFile (0x12): <multiSessionID u32> <count u16> then the
+    """UploadMultipleFile (0x12) and UploadMultipleFileZeroLength (0x15, the
+    empty files of a paste): <multiSessionID u32> <count u16> then the
     destination paths -- no size or large-file count, unlike 0x13."""
-    if len(cmd) < 7 or cmd[0] != CMD_UPLOAD_MULTI:
+    if len(cmd) < 7 or cmd[0] not in (CMD_UPLOAD_MULTI, CMD_UPLOAD_ZERO):
         raise ValueError("not an UploadMultipleFile")
     multi, count = struct.unpack(endian + "IH", cmd[1:7])
     return {"multi_session_id": multi, "files": _decode_upload_paths(cmd, 7, count, endian)}
@@ -1073,7 +1075,8 @@ REMOTE_OPERATION_ERROR_TEXT = "Remote operation error"
 
 class UploadReceiver:
     """Server side of an upload into a shared folder (THMGBServer's handlers):
-    0x13 -> 0xA8; 0x12 registers the files (answered only on error); 0x0C
+    0x13 -> 0xA8; 0x12 registers the files (answered only on error); 0x15
+    creates the empty ones (answered only on error); 0x0C
     pieces are written in order; when every file of a session is complete,
     DownloadMultiFileFinished (0xA7) carries the session ID; 0x14 aborts."""
 
@@ -1120,6 +1123,20 @@ class UploadReceiver:
             self.pending[multi] = {f["file_id"] for f in req["files"]}
             for f, real in zip(req["files"], reals):
                 self.files[f["file_id"]] = {"path": real, "multi": multi, "fh": None}
+            return []
+        if cmd[0] == CMD_UPLOAD_ZERO:
+            # THMGBServer createZeroLengthFiles:withErrorFileID: -- no reply on
+            # success, UploadMultiFileError (code 3) naming the failed file.
+            req = decode_upload_multi(cmd, self.req)
+            for f in req["files"]:
+                real = shared_path(f["path"], self.roots)
+                try:
+                    if real is None:
+                        raise OSError("not shared")
+                    os.makedirs(os.path.dirname(real), exist_ok=True)
+                    open(real, "wb").close()
+                except OSError:
+                    return self._error(req["multi_session_id"], f["file_id"])
             return []
         if cmd[0] == CMD_UPLOAD_FILE_DATA:
             if len(cmd) < FILE_DATA_HEADER:
@@ -1175,7 +1192,8 @@ def _server_replies(cmd, roots, resolver, uploads, trash):
     if roots and cmd[0] == CMD_MAKE_NEW_DIRECTORY:
         return [(r, "mkdir") for r in serve_make_new_directory(cmd, roots)]
     if roots and uploads is not None and cmd[0] in (
-            CMD_UPLOAD_CONFIRM, CMD_UPLOAD_MULTI, CMD_UPLOAD_FILE_DATA, CMD_UPLOAD_ABORT):
+            CMD_UPLOAD_CONFIRM, CMD_UPLOAD_MULTI, CMD_UPLOAD_FILE_DATA, CMD_UPLOAD_ABORT,
+            CMD_UPLOAD_ZERO):
         return [(r, "upload") for r in uploads.handle(cmd)]
     if cmd[0] == CMD_DOWNLOAD_MULTI and (resolver.offered or resolver.roots):
         return [(r, "serve") for r in serve_download(cmd, resolver)]

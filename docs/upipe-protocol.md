@@ -4,10 +4,16 @@
 
 - Which SCSI commands carry peer data (poll, fetch, send) and what the poll reply states mean
 - How a 64 KiB OTi packet is framed (integrity tail, chunk header, end-of-command terminator)
-- How GoBridge commands are encoded, with Login (`0x01`) and ResponseResult (`0xA1`) in full
+- How it differs from the HID `0xD9` injection path
+- How GoBridge commands are encoded, and which `THMGBServer`/`THMGBClient`
+  handler each command ID reaches ([selector map](#selector-map))
+- The clipboard (`0x39` XmlPacket: text, files, TIFF images), file download
+  and serving (`0x10`, MultipleFilePackage `0x3a`), the remote browser
+  (`0x04`), uploads (`0x13`/`0x12`/`0x15`/`0x0c`) and file operations
+  (New Folder, rename, Move to Trash), each verified live against the Mac
 - How to stand in for a GoBridge peer from Linux with `tools/upipe_peer.py`
-- What the clipboard push (`0x39` XmlPacket) looks like for text and files, and how to send text to the Mac
-- What is still unknown (file contents transfer, drag-and-drop, the `0xF0` CDB, `DUMMY_DATA`)
+- What is still unknown (drag-and-drop, the aborts, `0x37`, Windows-only
+  clipboard formats, the `0xF0` CDB, `DUMMY_DATA`)
 
 The HID injection path (`0xD9 '3'/'4'/'6'` CDBs with no data phase) is a
 separate mechanism, covered in [transport.md](transport.md#peer-link-vendor-scsi-cdb-packets-host--cable)
@@ -42,6 +48,20 @@ fetch or send depending on the reply.
   (stack contents); the cable ignores them as far as observed. The Linux tool sends zeros.
 - `0xF0` is probably `GetPhysicalBusType` (called from `ProcessIdleState`
   when the peer comes online). Unconfirmed.
+
+### Compared with the HID `0xD9` path
+
+| | HID injection | UPipe |
+|---|---|---|
+| CDB | `d9 '3'/'4'/'6' <12-byte payload> 4f 54`: the CDB *is* the packet | `d8` poll, `d9 28` fetch, `d9 2a` send; the CDB carries no payload |
+| Data phase | none | 16 B poll reply, 65 536 B per fetch or send |
+| Flow control | none; each CDB is sent on its own | each side polls; sends are gated by the poll state and the peer's announced count |
+| Framing | none | packet tail with checksum (Layer 2), chunk header, multi-packet commands reassembled by session (Layer 3) |
+| Content | one mouse, key or media report | GoBridge commands: ID byte plus payload (Layer 4) |
+| Errors | sense mapped to OTi result codes | same sense mapping ([Send errors](#send-errors)), plus `0xa9` and ResponseResult at the command layer |
+
+Both use 16-byte CDBs ending in `4f 54` on the same mass-storage LUN, and
+the same `SCSITask` plumbing in `OTiTransfer`.
 
 ### Poll reply (byte 0 = state)
 
@@ -147,6 +167,52 @@ Command IDs recovered so far (not exhaustive), from each class's `init`
 | `0x13` | UploadMultipleFileConfirm | | |
 | `0x14` | UploadMultipleFileAbort | | |
 | `0x15` | UploadMultipleFileZeroLength | | |
+
+### Selector map
+
+Every command travels in the same `d9 2a` send and `d9 28` fetch packets.
+What tells them apart is byte 0 of the reassembled command, not the CDB.
+Handlers are `THMGBServer(ServerCommandHandler)` for IDs below `0xa0` and
+`THMGBClient(ClientCommandHandler)` for `0xa0` and up. Payload fields are in
+the sender's byte order: the Mac sends big-endian, and a Linux peer sends
+little-endian ([Layer 4](#layer-4-commands)). Paths are UTF-16.
+
+| Handler | ID | Payload after the ID | Reply | Status |
+|---|---|---|---|---|
+| `handleLogin:` | `0x01` | `<os> <codePage u16> <nameLen> <name>` | `0xa1` with `OSVERSION` | live, both ways |
+| `handleLogout:` | `0x02` | not decoded (60 bytes from the Mac) | `0xa1` (decompile; `upipe_peer.py` sends none) | seen on a Wormhole.app restart |
+| `handleGetDirectoryInfo:` | `0x04` | `<len u16> <path>` | `0xa1`, `0xa2` | live |
+| `handleRemoveDirectory:` | `0x06` | `<session u32> <len u16> <path>` | `0xa1` 0/1 | live |
+| `handleMakeNewDirectory:` | `0x07` | `<session u32> <len u16> <path>` | `0xa1` | live |
+| `handleDeleteFile:` | `0x08` | `<session u32> <len u16> <path>` | `0xa1` 0/1 | live |
+| `handleRenameFile:` | `0x09` | `<session u32> <oldLen u16> <newLen u16> <old> <new>` | `0xa1`, error code on failure | live |
+| `handleUploadFileData:` | `0x0c` | `<fileID u32> <total u32> <index u32> <len u32> <data>` | `0xa7` when the session completes | live |
+| `handleDownloadMultipleFile:` | `0x10` | `<multi u32> <count u16> {<fileID u32> <len u16> <path>}` | `0xa1`, `0xa3`…, `0xa7` or `0xa9` | live, both ways |
+| `handleDownloadMultipleFileAbort:` | `0x11` | not decoded | — | not observed |
+| `handleUploadMultipleFile:` | `0x12` | `<multi u32> <count u16> {<fileID u32> <len u16> <path>}` | only on error | live |
+| `handleUploadMutipleFilesConfirm:` | `0x13` | `<multi u32> <size u64> <large u16> <count u16> {…}` | `0xa8` | live |
+| `handleUploadMultipleFileAbort:` | `0x14` | `<multi u32>` | none | from the decompile, not observed |
+| `handleUploadMultipleFilesWithZeroLength:` | `0x15` | as `0x12` | `0xa9` code 3 on failure only | live |
+| `handleChangeFileAttribute:` | `0x37` | not decoded | — | not observed |
+| `handleExtraXMLPacket:` | `0x39` | `<xmlLen u32> <xml>` | none | live, both ways (clipboard, drive list) |
+| (`THMFileManager handleMultipleFilePackage:`) | `0x3a` | `<count u32 LE> <11 bytes> <commands>` | per command | live, peer → Mac only |
+| `handleRequestResponse:` | `0xa1` | see [ResponseResult](#responseresult-0xa1) | — | live |
+| `handleDirectoryInfo:` | `0xa2` | `<count u16> <552-byte records> <free u64> <pad>` | — | live |
+| `handleDownloadFileData:` | `0xa3` | as `0x0c` | — | live, both ways |
+| `handleDriveInfo:` | `0xa4` | not decoded | — | not observed (a Linux peer uses the XML drive list) |
+| `handleDownloadFileZero:` | `0xa6` | `<session u32> <count u16> <fileIDs>` | — | not observed: the Mac sends an empty file as one empty `0xa3` |
+| `handleUploadDownloadFinish:` | `0xa7` | `<session u32>` | — | live, both ways |
+| `handleUploadMultipleFileConfirmation` | `0xa8` | `<4 flags> <session u32> <existCount u32> <IDs>` | — | live |
+| `handleUploadMultiFileError` | `0xa9` | `<session u32> <code u32> <fileID u32> <tag 6> <len u32> <string>` | — | live, both ways |
+| `handleDomainFolders:` | `0xad` | not decoded | — | not observed (sent to Windows/Mac peers only) |
+| `handleTransferFailed:` | ? | not decoded | — | not observed |
+
+Sections: [Login](#login-0x01), [clipboard](#xmlpacket-0x39-clipboard),
+[images](#xmlpacket-0x39-images), [download](#downloadmultiplefile-0x10-file-contents),
+[package](#multiplefilepackage-0x3a-several-commands-in-one),
+[browser](#getdirectoryinfo-0x04-and-directoryinfo-0xa2),
+[file operations](#file-operations-new-folder-rename-move-to-trash),
+[upload](#upload-mac--shared-folder).
 
 ### OS byte
 
@@ -479,20 +545,26 @@ A Finder copy pasted into Wormhole.app's remote browser (Edit > Paste) runs:
    in this location` dialog (Don't Replace / Stop / Replace, Apply to all).
    Don't Replace sent nothing more for that file (one file: no `0x12` at
    all, only a refresh). Replace went on as below and overwrote the file.
-4. `0x12` UploadMultipleFile, Mac → server, with no size fields:
+4. `0x15` UploadMultipleFileZeroLength for the paste's empty files, if
+   any, in the same layout as `0x12`. The Mac's server creates them
+   (`createZeroLengthFiles:withErrorFileID:`) and answers only on failure,
+   with `0xa9` code 3. A paste of only empty files ends here; the Mac sends
+   no data and expects no `0xa7`.
+5. `0x12` UploadMultipleFile, Mac → server, with no size fields, for the
+   other files:
    ```
    12 <multiSessionID u32> <count u16> { <fileID u32> <pathLen u16> <path UTF-16 + NUL> }*
    ```
    The server answers only on error (ResponseResult result 1).
-5. `0x0c` UploadFileData, Mac → server, one per piece, in the same form as
+6. `0x0c` UploadFileData, Mac → server, one per piece, in the same form as
    `0xa3`: `0c <fileID u32> <totalCount u32> <currentIndex u32> <dataLength u32> <data>`,
    at most 8 MiB per piece. Files go one after another.
-6. When every file of the session is written, the server sends `0xa7`
+7. When every file of the session is written, the server sends `0xa7`
    DownloadMultiFileFinished with the session ID. An error goes out as `0xa9`
    (code 3, `Remote operation error`). `0x14` UploadMultipleFileAbort carries
    the session ID.
 
-`0x0a` UploadFile, `0x0d` and `0x15` exist but were not seen.
+`0x0a` UploadFile and `0x0d` exist but were not seen.
 
 ### Copy: shared folder → Mac
 
@@ -573,6 +645,7 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `img` (`--login`; a 900 × 505 TIFF set as the Mac's clipboard) | A 1 024-byte XmlPacket, `Apple TIFF Format`, with the two temp paths; the encoder reproduces it byte for byte. `--download` of both paths: the TIFF (1 818 400 bytes) and the BMP (1 363 554), SHA-256 equal to the Mac's files. `--save-clipboard-images` saved the TIFF as `clipboard_1.tiff` (same hash) |
 | `imgpush` (`--clipboard-image`, 200 × 100 TIFF) | First try with an empty Bitmap element: the Mac fetched the file, then GoBridgeDemon crashed (above). Without the element: the Mac fetched it with `0x10` and its clipboard held the 60 140-byte TIFF; read back, 200 × 100 |
 | `pkg` (`--offer`, small files) | Two, then four, small files in one `0x3a`: the Mac logs `counts=2`/`counts=4` and `Did download N files`; all hashes match. With a 20 MiB file between two small ones nothing is bundled, and all three match |
+| `empty` (empty files) | `--download` of an empty Mac file: `0xa1`, one empty `0xa3`, `0xa7` (no `0xa6`). Pasting an empty file into a share: `0x07`, `0x13` (size 0), `0x15`; before the fix the tool ignored `0x15` and the file was silently missing, with no error on the Mac. After the fix the file is created. A mixed paste (empty plus 100 kB) sends `0x13` listing both, `0x15` for the empty one, `0x12` and `0x0c` for the other; both arrive and the hash matches |
 | `sharedl` (Copy in the remote browser, Paste in Finder) | The Mac sends `0x10` for the shared path; ResponseResult, `0xa3`, `0xa7`; the Mac logs `Did download 1 files`. SHA-256 matches |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
@@ -594,10 +667,9 @@ because they contain the Mac's host name.
 - Other `0xa9` error codes.
 - `0x37` ChangeFileAttribute: the Mac logs `setAttribute: 0` after each
   downloaded file but sent none in the tests.
-- `0x0a` UploadFile, `0x0d`, `0x15` (zero-length upload) and `0xaa`: when
+- `0x0a` UploadFile, `0x0d`, `0xaa`, `0xa4`, `0xa5`, `0xa6`, `0xab`: when
   the Mac uses them.
-- `0xa6` (zero-length file) and `0xa5`/`0xab`: `--offer` sends an empty file
-  as one empty `0xa3`, which is not verified live.
+- The aborts (`0x11`, `0x14`): cancel a transfer mid-way to capture them.
 - The other clipboard formats (`CB_Format_DIB`, `CB_Format_MutipleImages`,
   RTF, HTML, PDF): expected from Windows peers; only text, file and TIFF seen.
 - `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.

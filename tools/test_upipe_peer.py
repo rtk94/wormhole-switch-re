@@ -714,10 +714,10 @@ def mac_upload_files(command, multi, files, total_size, large=0):
     return out
 
 
-def mac_upload_multi(multi, files):
+def mac_upload_multi(multi, files, command=0x12):
     """0x12 as the Mac sent it (upload run, 101 bytes for one file): no size
-    or large-file count, unlike 0x13."""
-    out = bytes([0x12]) + struct.pack(">IH", multi, len(files))
+    or large-file count, unlike 0x13.  0x15 (empty files) has the same shape."""
+    out = bytes([command]) + struct.pack(">IH", multi, len(files))
     for fid, path in files:
         raw = (path + "\0").encode("utf-16-be")
         out += struct.pack(">IH", fid, len(raw)) + raw
@@ -741,6 +741,37 @@ class TestUpload(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_zero_length_upload_creates_empty_files(self):
+        # The Mac's 101-byte 0x15 (empty run): session 105, file 111.
+        cmd = mac_upload_multi(105, [(111, self.dest)], command=0x15)
+        self.assertEqual(len(cmd), 7 + 6 + 2 * (len(self.dest) + 1))
+        self.assertEqual(u.describe_command(cmd)["files"], [{"file_id": 111, "path": self.dest}])
+        # THMGBServer createZeroLengthFiles: answers only on failure.
+        self.assertEqual(self.rx.handle(cmd), [])
+        self.assertEqual(os.path.getsize(self.dest), 0)
+
+    def test_zero_length_upload_replaces_existing_file(self):
+        with open(self.dest, "wb") as f:
+            f.write(b"old")
+        self.rx.handle(mac_upload_multi(1, [(1, self.dest)], command=0x15))
+        self.assertEqual(os.path.getsize(self.dest), 0)
+
+    def test_zero_length_upload_outside_share_errors(self):
+        outside = os.path.join(self.tmp.name, "out.txt")
+        replies = self.rx.handle(mac_upload_multi(7, [(8, outside)], command=0x15))
+        self.assertEqual(len(replies), 1)
+        err = u.decode_upload_error(replies[0], "<")
+        self.assertEqual((err["session_id"], err["error_code"], err["file_id"]),
+                         (7, u.REMOTE_OPERATION_ERROR, 8))
+        self.assertFalse(os.path.exists(outside))
+
+    def test_zero_length_upload_routed(self):
+        r = u.FileResolver({}, [self.root])
+        replies = u.server_replies(mac_upload_multi(1, [(1, self.dest)], command=0x15),
+                                   [self.root], r, self.rx)
+        self.assertEqual(replies, [])
+        self.assertTrue(os.path.exists(self.dest))
 
     def test_decode_mac_confirm(self):
         # Shape of the Mac's 111-byte 0x13 (upload run): session 105, 100 000 bytes, 1 file.
