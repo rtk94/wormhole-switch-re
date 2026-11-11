@@ -8,7 +8,8 @@ Every fetched 64 KiB packet is written to --out together with a JSONL log.
 Without --login the tool is receive-only: it sends only the status poll and
 the fetch command.  With --login NAME it also answers the peer's LoginCommand
 with a ResponseResult and logs in to the peer under NAME, which is what the
-GoBridge daemon waits for before going any further.
+GoBridge daemon waits for before going any further.  --clipboard TEXT then
+pushes TEXT to the peer's clipboard as a Cmd_Transfer_Clipboard XmlPacket.
 
 Layers (decompiled from macOS OTiTransfer + GoBridgeDemon; see
 docs/upipe-protocol.md):
@@ -30,6 +31,7 @@ Raw packets can carry host names and user data: keep --out outside the repo.
 Usage:
   python3 tools/upipe_peer.py /dev/sgN --out ~/wormhole-private/upipe/RUN --seconds 60
   python3 tools/upipe_peer.py /dev/sgN --out ... --login linux-peer
+  python3 tools/upipe_peer.py /dev/sgN --out ... --login linux-peer --clipboard "hello"
 """
 
 import argparse
@@ -67,6 +69,7 @@ STATES = {
 
 CMD_LOGIN = 0x01
 CMD_LOGOUT = 0x02
+CMD_XML = 0x39
 CMD_RESPONSE = 0xA1
 COMMANDS = {
     0x00: "Dummy", 0x01: "Login", 0x02: "Logout", 0x04: "GetDirectoryInfo",
@@ -263,6 +266,59 @@ def decode_response(cmd):
     return out
 
 
+def encode_xml_packet(xml):
+    """XmlPacketCommand: 39 <xml length BE32> <xml, UTF-8, no terminator>."""
+    raw = xml.encode("utf-8")
+    return bytes([CMD_XML]) + struct.pack(">I", len(raw)) + raw
+
+
+def decode_xml_packet(cmd):
+    if len(cmd) < 5 or cmd[0] != CMD_XML:
+        raise ValueError("not an XmlPacket")
+    n = struct.unpack(">I", cmd[1:5])[0]
+    if 5 + n > len(cmd):
+        raise ValueError("XmlPacket length %d exceeds command" % n)
+    return cmd[5:5 + n].decode("utf-8", "replace")
+
+
+# Clipboard push as the Mac sends it (2026-11-11 capture); the pipe name and
+# HookAppService are the Windows clipboard agent's routing, kept verbatim.
+CLIPBOARD_XML = (
+    "<ExtraXmlCommand>HookAppService</ExtraXmlCommand><ExtraXmlParam><OTIMSG>"
+    "<Param_Clipboard_Info_2><OTIMSG>{body}</OTIMSG></Param_Clipboard_Info_2>"
+    "<NP_Cmd>Cmd_Transfer_Clipboard</NP_Cmd>"
+    "<NP_Up_Notice_NamePipe_Name>\\\\.\\pipe\\OTI_ClipboardAgent</NP_Up_Notice_NamePipe_Name>"
+    "</OTIMSG></ExtraXmlParam>")
+
+
+def encode_clipboard_text(text):
+    """Cmd_Transfer_Clipboard XmlPacket carrying text (UTF-16LE + NUL, uppercase hex)."""
+    content = (text + "\0").encode("utf-16le").hex().upper()
+    body = "<CP_Content>%s</CP_Content><CB_Format_Type>CB_Format_Text</CB_Format_Type>" % content
+    return encode_xml_packet(CLIPBOARD_XML.format(body=body))
+
+
+def _tag(xml, name):
+    start, end = "<%s>" % name, "</%s>" % name
+    i = xml.find(start)
+    j = xml.find(end, i + len(start)) if i >= 0 else -1
+    return xml[i + len(start):j] if i >= 0 and j >= 0 else None
+
+
+def decode_clipboard(xml):
+    """Pull the clipboard fields out of a Cmd_Transfer_Clipboard XmlPacket."""
+    out = {"np_cmd": _tag(xml, "NP_Cmd"), "cb_format": _tag(xml, "CB_Format_Type")}
+    content = _tag(xml, "CP_Content")
+    if content is not None:
+        try:
+            out["text"] = bytes.fromhex(content).decode("utf-16le").rstrip("\0")
+        except ValueError as e:
+            out["text_error"] = str(e)
+    if "<NodeInfo>" in xml:
+        out["files"] = xml.count("<NodeInfo>")
+    return out
+
+
 def describe_command(cmd):
     if not cmd:
         return {"command": None}
@@ -272,6 +328,8 @@ def describe_command(cmd):
             out.update(decode_login(cmd))
         elif cmd[0] == CMD_RESPONSE:
             out.update(decode_response(cmd))
+        elif cmd[0] == CMD_XML:
+            out.update(decode_clipboard(decode_xml_packet(cmd)))
     except ValueError as e:
         out["decode_error"] = str(e)
     return out
@@ -326,7 +384,11 @@ def main(argv):
                     help="answer the peer's login and log in to it as NAME (enables sending)")
     ap.add_argument("--os", choices=sorted(OS_NAMES.values()), default="linux",
                     help="OS type to announce with --login (default linux)")
+    ap.add_argument("--clipboard", metavar="TEXT",
+                    help="with --login: push TEXT to the peer's clipboard once logged in")
     args = ap.parse_args(argv)
+    if args.clipboard is not None and not args.login:
+        ap.error("--clipboard needs --login")
     os_byte = {v: k for k, v in OS_NAMES.items()}[args.os]
 
     os.makedirs(args.out, exist_ok=True)
@@ -340,7 +402,7 @@ def main(argv):
     fd = os.open(args.dev, os.O_RDWR)
     fetch, send = build_fetch_cdb(), build_send_cdb()
     framer, reasm, txq = Framer(), Reassembler(), []
-    logged_in = False
+    clipboard_sent = False
     end = time.time() + args.seconds
     last_state, n_rx, n_tx = None, 0, 0
     emit({"event": "start", "dev": args.dev, "fetch_cdb": fetch.hex(), "send_cdb": send.hex(),
@@ -352,6 +414,11 @@ def main(argv):
         emit({"event": "queue", "why": why, "packets": len(pkts), **describe_command(cmd),
               "cmd_hex": cmd.hex()})
         print("queue", why, len(pkts), "packets", cmd[:24].hex(), flush=True)
+
+    # Log in straight away: a peer that still thinks we are logged in from an
+    # earlier run sends no new Login of its own to trigger ours.
+    if args.login:
+        queue(encode_login(args.login, os_byte), "login")
 
     try:
         while time.time() < end:
@@ -392,9 +459,11 @@ def main(argv):
                     print("command", desc, flush=True)
                     if args.login and cmd[:1] == bytes([CMD_LOGIN]):
                         queue(encode_response(CMD_LOGIN, 0, os_byte), "login-response")
-                        if not logged_in:
-                            queue(encode_login(args.login, os_byte), "login")
-                            logged_in = True
+                    # The peer's ResponseResult to our Login = we are logged in.
+                    if (args.clipboard is not None and not clipboard_sent
+                            and cmd[:2] == bytes([CMD_RESPONSE, CMD_LOGIN])):
+                        queue(encode_clipboard_text(args.clipboard), "clipboard")
+                        clipboard_sent = True
                 if not ok:
                     break
 

@@ -6,7 +6,7 @@
 - How a 64 KiB OTi packet is framed (integrity tail, chunk header, end-of-command terminator)
 - How GoBridge commands are encoded, with Login (`0x01`) and ResponseResult (`0xA1`) in full
 - How to stand in for a GoBridge peer from Linux with `tools/upipe_peer.py`
-- What the clipboard push (`0x39` XmlPacket) looks like for text and files
+- What the clipboard push (`0x39` XmlPacket) looks like for text and files, and how to send text to the Mac
 - What is still unknown (file contents transfer, drag-and-drop, the `0xF0` CDB, `DUMMY_DATA`)
 
 The HID injection path (`0xD9 '3'/'4'/'6'` CDBs with no data phase) is a
@@ -170,6 +170,11 @@ Both sides are client and server at once:
 3. On a Linux peer the Mac logs `remote is linux` and skips
    `forwardDomainFoldersInfoToRemote`, which Windows and Mac peers receive.
 
+Either side may log in first. If the Linux side restarts soon after
+stopping (40 s in the one observed case; the timeout is unknown), the Mac still treats it as logged in and sends no new Login, so
+`upipe_peer.py` sends its own Login at startup; the Mac answers it with a
+ResponseResult either way.
+
 ### XmlPacket (`0x39`): clipboard
 
 ```
@@ -211,7 +216,12 @@ The XML is one line; indented here:
   paste (presumably the `0x04`… file commands) is not captured yet.
 - The named-pipe name and `HookAppService` are Windows clipboard-agent
   routing, sent unchanged by the Mac.
-- The Linux tool sends no reply and the Mac does not wait for one.
+- No reply is sent or expected in either direction.
+- The same message works from Linux to the Mac (`--clipboard`): the Mac's
+  `Clipboard Handler` logs `addFromUPipeMsg(): Found incoming clipboard data and
+  success update to pastboard..` and `pbpaste` returns the text, including
+  non-ASCII and non-BMP characters (`é ✓ 日本語 😀`) and `\n` line breaks. It
+  does not echo the text back (`Found pboard owned by SKM...`).
 
 ## Linux peer: `tools/upipe_peer.py`
 
@@ -224,6 +234,8 @@ readable by your user (`cdrom` group on Debian). Keep `--out` outside the repo.
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 60
 # Also answer the peer's Login and log in to it as "linux-peer"
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 60 --login linux-peer
+# Also push text to the Mac's clipboard once the Mac accepts the login
+python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 20 --login linux-peer --clipboard "hello"
 python3 -m unittest tools.test_upipe_peer
 ```
 
@@ -244,6 +256,7 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `macpeer` (receive only) | Linux polls → state `0x07`, then `0x05` with 2 waiting; fetches Login (seq 2, session 2) and a terminator. Both 64 KiB packets match the Mac's dtrace data-out buffers byte for byte. The Mac logs `login to remote with name: …`, `Send command: 1` and waits |
 | `login` (`--login linux-peer`) | Mac's Login (seq 3, session 3) arrives; Linux queues ResponseResult + its own Login (4 packets); all 4 sends succeed; the Mac fetches all 4, logs `ResponseResult(0xa1) {_RequestCommand:1, _RequestResult:0, …}`, `did login to remote`, `[Login Command] Os Type:20 ,name: linux-peer`, `remote has login`, `remote is linux`, and replies with its own 44-byte ResponseResult (OS `0x16`). Wormhole.app logs `remoteDidLoginWithName linux-peer, os: 32` |
 | `xfer` (`--login`, then user actions on the Mac) | Same handshake. Copying text sends a 587-byte XmlPacket (`CB_Format_Text`, seq 7); copying a `.jpg` in Finder sends a 2 049-byte one (`CB_Format_File`, one `NodeInfo`, seq 8). Dragging a file toward the Linux side sent nothing: the Mac logs `DragDrop getScreenFrame` and later `Clear the dragdropboard contents`. The Mac logged only these two pasteboard changes (`changeCount` 1 and 2). 39 061 polls, no send errors |
+| `clip` (`--login linux-peer --clipboard …`, two runs) | Linux's text arrives in the Mac's pasteboard (checked with `pbpaste` over ssh). The encoder reproduces the Mac's own 587-byte text packet from `xfer` byte for byte. In a second run 40 s later the Mac sent no Login; after the tool was changed to log in first, the Mac answered with a ResponseResult and accepted the second push |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
 `tools/filter_usbmon.py` (19 830 records, sha256 `11b0da0e…`), shows

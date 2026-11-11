@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import os
 import sys
 import unittest
@@ -148,6 +149,41 @@ class TestCommands(unittest.TestCase):
     def test_describe(self):
         self.assertEqual(u.describe_command(u.encode_login("x"))["command_name"], "Login")
         self.assertEqual(u.describe_command(bytes([0x77]))["command_name"], "unknown")
+
+
+class TestClipboard(unittest.TestCase):
+    # Text the Mac pushed in the 2026-11-11 xfer capture (587-byte command).
+    MAC_TEXT = "Test Test Test.\nThis is a test.\nCopying some test text."
+    MAC_SHA256 = "1e2db0d59c6ddc615fd33f3ac603bbd82cba0920aafe11ad6802fd301e7a5186"
+
+    def test_matches_mac_capture(self):
+        cmd = u.encode_clipboard_text(self.MAC_TEXT)
+        self.assertEqual(len(cmd), 587)
+        self.assertEqual(cmd[:5].hex(), "3900000246")
+        self.assertEqual(hashlib.sha256(cmd).hexdigest(), self.MAC_SHA256)
+
+    def test_text_roundtrip(self):
+        text = "héllo ✓ from linux\n"
+        d = u.describe_command(u.encode_clipboard_text(text))
+        self.assertEqual(d["command_name"], "XmlPacket")
+        self.assertEqual((d["np_cmd"], d["cb_format"], d["text"]),
+                         ("Cmd_Transfer_Clipboard", "CB_Format_Text", text))
+
+    def test_content_is_uppercase_utf16_hex(self):
+        xml = u.decode_xml_packet(u.encode_clipboard_text("A"))
+        self.assertIn("<CP_Content>41000000</CP_Content>", xml)
+        self.assertIn(r"\\.\pipe\OTI_ClipboardAgent", xml)
+
+    def test_file_entries_counted(self):
+        xml = u.CLIPBOARD_XML.format(body="<NodeInfoList><Line><NodeInfo>00</NodeInfo></Line>"
+                                     "</NodeInfoList><CB_Format_Type>CB_Format_File</CB_Format_Type>")
+        d = u.decode_clipboard(xml)
+        self.assertEqual((d["cb_format"], d["files"]), ("CB_Format_File", 1))
+        self.assertNotIn("text", d)
+
+    def test_bad_length(self):
+        with self.assertRaises(ValueError):
+            u.decode_xml_packet(b"\x39\x00\x00\x00\x09abc")
 
 
 class TestHeader(unittest.TestCase):
