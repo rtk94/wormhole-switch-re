@@ -100,7 +100,8 @@ function New-TestImage([string]$Path, [int]$W, [int]$H, [string]$Label, [int]$Hu
     $bmp = New-Object Drawing.Bitmap $W, $H
     $g = [Drawing.Graphics]::FromImage($bmp)
     for ($x = 0; $x -lt $W; $x += 4) {
-        $c = [Drawing.Color]::FromArgb(255, ($Hue + $x) % 256, (2 * $x) % 256, (255 - $x) % 256)
+        # PowerShell's % keeps the sign, so keep every channel in 0..255 explicitly.
+        $c = [Drawing.Color]::FromArgb(255, ($Hue + $x) % 256, (2 * $x) % 256, 255 - ($x % 256))
         $g.FillRectangle((New-Object Drawing.SolidBrush $c), $x, 0, 4, $H)
     }
     $font = New-Object Drawing.Font 'Arial', 20
