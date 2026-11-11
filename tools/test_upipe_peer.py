@@ -406,6 +406,316 @@ class TestServeDownload(unittest.TestCase):
         self.assertEqual(struct.unpack("<IIII", cmds[1][1:17]), (5, 1, 1, 0))
 
 
+class TestCommandTable(unittest.TestCase):
+    def test_ids_from_decompiled_init_methods(self):
+        # -[<Class> init] setCommandID: values in GoBridgeDemon 152311cb.
+        self.assertEqual(u.COMMANDS[0x0C], "UploadFileData")
+        self.assertEqual(u.COMMANDS[0x34], "SyncDynamic")
+        self.assertEqual(u.COMMANDS[0x37], "ChangeFileAttribute")
+        self.assertEqual(u.COMMANDS[0xA2], "DirectoryInfo")
+        self.assertEqual(u.COMMANDS[0xA4], "DriveInfo")
+        self.assertEqual(u.COMMANDS[0x12], "UploadMultipleFile")
+
+
+class TestBrowse(unittest.TestCase):
+    """Linux as the file server for Wormhole.app's remote browser."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "share")
+        os.makedirs(os.path.join(self.root, "sub"))
+        with open(os.path.join(self.root, "a.txt"), "wb") as f:
+            f.write(b"x" * 1234)
+        os.utime(os.path.join(self.root, "a.txt"), (1475782699, 1475782700))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_decode_mac_get_directory_info(self):
+        # The Mac's 0x04 from the drives run: BE16 length, UTF-16BE, no NUL.
+        path = "/home/user/share"
+        raw = path.encode("utf-16-be")
+        cmd = bytes([0x04]) + struct.pack(">H", len(raw)) + raw
+        self.assertEqual(u.decode_get_directory_info(cmd), path)
+        self.assertEqual(u.describe_command(cmd)["path"], path)
+
+    def test_drive_list_xml(self):
+        cmd = u.encode_drive_list([("/home/user/share", 1000, 400)])
+        xml = u.decode_xml_packet(cmd)
+        self.assertTrue(xml.startswith("<ExtraXmlCommand>HookAppService</ExtraXmlCommand>"
+                                       "<ExtraXmlParam><OTIMSG><NP_Cmd>"
+                                       "NP_Cmd_Post_Drive_Update_Info</NP_Cmd>"))
+        self.assertIn("<NP_Remote_Request_Info><NP_Misc_Drive_ListMRS><Line>"
+                      "<NP_Misc_Drive_Letter>/home/user/share</NP_Misc_Drive_Letter>"
+                      "<NP_Misc_Drive_Total_Space_Number>1000</NP_Misc_Drive_Total_Space_Number>"
+                      "<NP_Misc_Drive_Free_Space_Number>400</NP_Misc_Drive_Free_Space_Number>"
+                      "</Line></NP_Misc_Drive_ListMRS></NP_Remote_Request_Info>", xml)
+
+    def test_drive_list_escapes_xml(self):
+        xml = u.decode_xml_packet(u.encode_drive_list([("/a&b<c", 1, 1)]))
+        self.assertIn("/a&amp;b&lt;c", xml)
+
+    def test_directory_record_layout(self):
+        rec = u.encode_directory_record("a.txt", 0, 1234, 100, 200, 300, "<")
+        self.assertEqual(len(rec), 552)
+        words = struct.unpack_from("<10I", rec)
+        # attrs; ctime, atime, mtime as (low, high) Unix seconds; size low, high; name
+        # bytes.  Time word order checked live: (T, 0) showed T in Wormhole.app,
+        # (0, T) showed the year 5828963 (dates run, 2026-11-11).
+        self.assertEqual(words, (0, 100, 0, 200, 0, 300, 0, 1234, 0, 10))
+        self.assertEqual(rec[40:50].decode("utf-16-le"), "a.txt")
+        self.assertEqual(rec[50:], bytes(552 - 50))
+
+    def test_directory_record_large_size_and_long_name(self):
+        rec = u.encode_directory_record("n" * 300, 0x10, (3 << 32) + 5, 0, 0, 0, "<")
+        self.assertEqual(struct.unpack_from("<I", rec, 0)[0], 0x10)
+        self.assertEqual(struct.unpack_from("<II", rec, 28), (5, 3))
+        self.assertEqual(struct.unpack_from("<I", rec, 36)[0], 512)   # truncated to fit
+
+    def test_directory_record_time_beyond_32_bits(self):
+        rec = u.encode_directory_record("a", 0, 0, (1 << 32) + 2, 0, 0, "<")
+        self.assertEqual(struct.unpack_from("<II", rec, 4), (2, 1))
+
+    def test_directory_info_roundtrip(self):
+        cmd = u.encode_directory_info([("a", 0, 1, 2, 3, 4), ("b", 0x10, 0, 2, 3, 4)],
+                                      free_space=(7 << 32) + 9)
+        self.assertEqual(cmd[0], 0xA2)
+        d = u.decode_directory_info(cmd, "<")
+        self.assertEqual([(e["name"], e["directory"], e["size"], e["mtime"]) for e in d["entries"]],
+                         [("a", False, 1, 4), ("b", True, 0, 4)])
+        self.assertEqual(d["free_space"], (7 << 32) + 9)
+        # One pad byte: the Mac reads the free space only when more follows it.
+        self.assertEqual(len(cmd), 1 + 2 + 2 * 552 + 8 + 1)
+
+    def test_free_space_without_pad_is_ignored_like_the_mac(self):
+        cmd = u.encode_directory_info([("a", 0, 1, 2, 3, 4)], free_space=5)[:-1]
+        self.assertNotIn("free_space", u.decode_directory_info(cmd, "<"))
+
+    def test_list_directory_reads_shared_tree(self):
+        entries = u.list_directory(self.root)
+        by_name = {e[0]: e for e in entries}
+        self.assertEqual(sorted(by_name), ["a.txt", "sub"])
+        self.assertEqual(by_name["a.txt"][1:3], (0, 1234))
+        self.assertEqual(by_name["a.txt"][5], 1475782700)          # mtime
+        self.assertEqual(by_name["sub"][1], 0x10)
+
+    def test_list_directory_marks_dotfiles_hidden(self):
+        open(os.path.join(self.root, ".hidden"), "w").close()
+        by_name = {e[0]: e for e in u.list_directory(self.root)}
+        self.assertEqual(by_name[".hidden"][1], 0x02)
+
+    def test_serve_directory_inside_share(self):
+        cmd = u.encode_get_directory_info(os.path.join(self.root, "sub"), ">")
+        replies = u.serve_get_directory_info(cmd, [self.root])
+        self.assertEqual([r[0] for r in replies], [0xA1, 0xA2])
+        self.assertEqual(replies[0][1:3], bytes([0x04, 0]))
+        self.assertEqual(u.decode_directory_info(replies[1], "<")["entries"], [])
+
+    def test_serve_refuses_path_outside_share(self):
+        for path in (self.tmp.name, os.path.join(self.root, "..", "x"), "/etc"):
+            replies = u.serve_get_directory_info(u.encode_get_directory_info(path, ">"),
+                                                 [self.root])
+            self.assertEqual([r[0] for r in replies], [0xA1], path)
+            # requestResult 1 and errorCode 3, as THMGBServer answers an unreadable path
+            self.assertEqual(replies[0][1:3], bytes([0x04, 1]))
+            self.assertEqual(struct.unpack_from("<I", replies[0], 7)[0], 3)
+
+    def test_after_login_posts_drive_list(self):
+        cmds = u.after_login_commands(share=[self.root])
+        self.assertEqual([why for _c, why in cmds], ["drives"])
+        self.assertIn("<NP_Misc_Drive_Letter>%s</NP_Misc_Drive_Letter>" % self.root,
+                      u.decode_xml_packet(cmds[0][0]))
+
+    def test_resolver_serves_shared_files_and_offers_only(self):
+        offered = os.path.join(self.tmp.name, "offered.bin")
+        open(offered, "w").close()
+        r = u.FileResolver({offered: offered}, [self.root])
+        self.assertEqual(r.get(offered), offered)
+        self.assertEqual(r.get(os.path.join(self.root, "a.txt")),
+                         os.path.realpath(os.path.join(self.root, "a.txt")))
+        self.assertIsNone(r.get(os.path.join(self.root, "sub")))       # not a file
+        self.assertIsNone(r.get(os.path.join(self.tmp.name, "other")))
+        req = mac_download_request(9, [(9, os.path.join(self.root, "a.txt"))])
+        self.assertEqual([c[0] for c in u.serve_download(req, r)], [0xA1, 0xA3, 0xA7])
+
+    def test_decode_mac_make_new_directory(self):
+        # The Mac's 0x07 before an upload (share run): session BE32, BE16
+        # length, UTF-16BE path with a NUL.
+        raw = (self.root + "\0").encode("utf-16-be")
+        cmd = bytes([0x07]) + struct.pack(">IH", 105, len(raw)) + raw
+        self.assertEqual(u.decode_make_new_directory(cmd), {"session_id": 105, "path": self.root})
+        self.assertEqual(u.describe_command(cmd)["path"], self.root)
+
+    def test_make_directory_inside_share(self):
+        new = os.path.join(self.root, "sub", "new")
+        replies = u.serve_make_new_directory(u.encode_make_new_directory(1, new), [self.root])
+        self.assertTrue(os.path.isdir(new))
+        self.assertEqual([r[:3] for r in replies], [bytes([0xA1, 0x07, 0])])
+
+    def test_make_existing_directory_succeeds(self):
+        replies = u.serve_make_new_directory(u.encode_make_new_directory(1, self.root), [self.root])
+        self.assertEqual(replies[0][2], 0)
+
+    def test_make_directory_outside_share_refused(self):
+        outside = os.path.join(self.tmp.name, "outside")
+        replies = u.serve_make_new_directory(u.encode_make_new_directory(1, outside), [self.root])
+        self.assertFalse(os.path.exists(outside))
+        self.assertEqual(replies[0][2], 1)
+
+    def test_server_replies_dispatch(self):
+        r = u.FileResolver({}, [self.root])
+        listing = u.server_replies(u.encode_get_directory_info(self.root), [self.root], r)
+        self.assertEqual([(c[0], why) for c, why in listing], [(0xA1, "browse"), (0xA2, "browse")])
+        mkdir = u.server_replies(u.encode_make_new_directory(1, self.root), [self.root], r)
+        self.assertEqual([(c[0], why) for c, why in mkdir], [(0xA1, "mkdir")])
+        self.assertEqual(u.server_replies(bytes([0x02]), [self.root], r), [])
+        # Nothing shared or offered: browsing and mkdir are not answered at all.
+        self.assertEqual(u.server_replies(u.encode_get_directory_info(self.root), [],
+                                          u.FileResolver({}, [])), [])
+
+    def test_serve_refuses_symlink_escape(self):
+        os.symlink("/etc", os.path.join(self.root, "link"))
+        replies = u.serve_get_directory_info(
+            u.encode_get_directory_info(os.path.join(self.root, "link"), ">"), [self.root])
+        self.assertEqual(replies[0][2], 1)
+
+
+def mac_upload_files(command, multi, files, total_size, large=0):
+    """0x13 / 0x12 as the Mac sends them (upload run): BE fields, UTF-16BE
+    paths with a NUL.  files: (fileID, path)."""
+    out = bytes([command]) + struct.pack(">IQHH", multi, total_size, large, len(files))
+    for fid, path in files:
+        raw = (path + "\0").encode("utf-16-be")
+        out += struct.pack(">IH", fid, len(raw)) + raw
+    return out
+
+
+def mac_upload_multi(multi, files):
+    """0x12 as the Mac sent it (upload run, 101 bytes for one file): no size
+    or large-file count, unlike 0x13."""
+    out = bytes([0x12]) + struct.pack(">IH", multi, len(files))
+    for fid, path in files:
+        raw = (path + "\0").encode("utf-16-be")
+        out += struct.pack(">IH", fid, len(raw)) + raw
+    return out
+
+
+def mac_file_data(file_id, total, index, data):
+    return bytes([0x0C]) + struct.pack(">IIII", file_id, total, index, len(data)) + data
+
+
+class TestUpload(unittest.TestCase):
+    """Linux as the server for uploads pasted into Wormhole.app's browser."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "share")
+        os.makedirs(self.root)
+        self.rx = u.UploadReceiver([self.root])
+        self.dest = os.path.join(self.root, "up.bin")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_decode_mac_confirm(self):
+        # Shape of the Mac's 111-byte 0x13 (upload run): session 105, 100 000 bytes, 1 file.
+        cmd = mac_upload_files(0x13, 105, [(106, self.dest)], 100000)
+        self.assertEqual(u.decode_upload_files(cmd), {
+            "multi_session_id": 105, "total_size": 100000, "large_files": 0,
+            "files": [{"file_id": 106, "path": self.dest}]})
+        self.assertEqual(u.describe_command(cmd)["multi_session_id"], 105)
+
+    def test_confirmation_layout(self):
+        cmd = u.encode_upload_confirmation(105, [7, 9])
+        self.assertEqual(cmd.hex(), "a8" "00010000" "69000000" "02000000" "07000000" "09000000")
+
+    def test_confirm_reports_existing_files_and_space(self):
+        open(self.dest, "w").close()
+        other = os.path.join(self.root, "new.bin")
+        replies = self.rx.handle(mac_upload_files(0x13, 105, [(1, self.dest), (2, other)], 10))
+        self.assertEqual(replies, [u.encode_upload_confirmation(105, [1])])
+
+    def test_confirm_outside_share_is_read_only(self):
+        outside = os.path.join(self.tmp.name, "x.bin")
+        (reply,) = self.rx.handle(mac_upload_files(0x13, 5, [(1, outside)], 10))
+        self.assertEqual(reply[4], 1)                                # destRootPathReadOnlyFlag
+
+    def test_confirm_without_space(self):
+        (reply,) = self.rx.handle(mac_upload_files(0x13, 5, [(1, self.dest)], 1 << 62))
+        self.assertEqual(reply[2], 0)                                # freeSpaceFlag
+
+    def test_upload_one_file_in_pieces(self):
+        self.assertEqual(self.rx.handle(mac_upload_multi(105, [(106, self.dest)])), [])
+        self.assertEqual(self.rx.handle(mac_file_data(106, 2, 1, b"abc")), [])
+        self.assertEqual(self.rx.handle(mac_file_data(106, 2, 2, b"def")),
+                         [u.encode_download_finished(105, "<")])
+        with open(self.dest, "rb") as f:
+            self.assertEqual(f.read(), b"abcdef")
+
+    def test_finished_only_after_every_file(self):
+        second = os.path.join(self.root, "sub", "two.bin")          # parent created on demand
+        self.rx.handle(mac_upload_multi(8, [(8, self.dest), (9, second)]))
+        self.assertEqual(self.rx.handle(mac_file_data(8, 1, 1, b"a")), [])
+        self.assertEqual(self.rx.handle(mac_file_data(9, 1, 1, b"b")),
+                         [u.encode_download_finished(8, "<")])
+        with open(second, "rb") as f:
+            self.assertEqual(f.read(), b"b")
+
+    def test_empty_file(self):
+        self.rx.handle(mac_upload_multi(3, [(3, self.dest)]))
+        self.assertEqual(self.rx.handle(mac_file_data(3, 1, 1, b"")),
+                         [u.encode_download_finished(3, "<")])
+        self.assertEqual(os.path.getsize(self.dest), 0)
+
+    def test_upload_outside_share_refused(self):
+        outside = os.path.join(self.tmp.name, "x.bin")
+        replies = self.rx.handle(mac_upload_multi(4, [(4, outside)]))
+        self.assertEqual([r[:3] for r in replies], [bytes([0xA1, 0x12, 1])])
+        self.assertEqual(self.rx.handle(mac_file_data(4, 1, 1, b"x")),
+                         [u.encode_upload_error(4, 3, 4, "Remote operation error", "<")])
+        self.assertFalse(os.path.exists(outside))
+
+    def test_data_for_unknown_file_is_an_error(self):
+        self.assertEqual(self.rx.handle(mac_file_data(77, 1, 1, b"x")),
+                         [u.encode_upload_error(77, 3, 77, "Remote operation error", "<")])
+
+    def test_abort_drops_the_session(self):
+        self.rx.handle(mac_upload_multi(5, [(5, self.dest)]))
+        self.rx.handle(mac_file_data(5, 2, 1, b"a"))
+        self.assertEqual(self.rx.handle(bytes([0x14]) + struct.pack(">I", 5)), [])
+        self.assertEqual(self.rx.handle(mac_file_data(5, 2, 2, b"b"))[0][0], 0xA9)
+
+    def test_decode_mac_upload_multi(self):
+        # The Mac's 101-byte 0x12 (upload run): session 105, one file, ID 106.
+        cmd = mac_upload_multi(105, [(106, "/home/user/share/wh_ok.bin")])
+        self.assertEqual(len(cmd), 7 + 6 + 2 * 27)
+        self.assertEqual(u.decode_upload_multi(cmd), {
+            "multi_session_id": 105,
+            "files": [{"file_id": 106, "path": "/home/user/share/wh_ok.bin"}]})
+        self.assertEqual(u.describe_command(cmd)["files"][0]["file_id"], 106)
+
+    def test_malformed_request_does_not_raise(self):
+        r = u.FileResolver({}, [self.root])
+        bad = mac_upload_multi(1, [(1, self.dest)])[:-5]
+        replies = u.server_replies(bad, [self.root], r, self.rx)
+        self.assertEqual([(c[:3], why) for c, why in replies],
+                         [(bytes([0xA1, 0x12, 1]), "error")])
+
+    def test_describe_malformed_request_does_not_raise(self):
+        bad = mac_upload_multi(1, [(1, self.dest)])[:-5]
+        desc = u.describe_command(bad)
+        self.assertEqual(desc["command_name"], "UploadMultipleFile")
+        self.assertIn("truncated", desc["decode_error"])
+
+    def test_server_replies_routes_uploads(self):
+        r = u.FileResolver({}, [self.root])
+        replies = u.server_replies(mac_upload_files(0x13, 1, [(1, self.dest)], 1), [self.root],
+                                   r, self.rx)
+        self.assertEqual([(c[0], why) for c, why in replies], [(0xA8, "upload")])
+
+
 class TestDownload(unittest.TestCase):
     def test_request_layout_big_endian(self):
         cmd = u.encode_download_request(1, [(7, "/a/b")], endian=">")

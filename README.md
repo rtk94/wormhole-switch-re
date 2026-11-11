@@ -83,7 +83,7 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
     ├── test_filter_usbmon.py     # unittest suite for the filter (9 tests)
     ├── peer_rerun_send.py        # logged send driver for the peer->local re-run (sg_raw and SG_IO)
     ├── test_peer_rerun_send.py   # unittest suite for the driver (4 tests)
-    ├── upipe_peer.py             # Linux UPipe peer: login, clipboard push, file download and serving (SG_IO)
+    ├── upipe_peer.py             # Linux UPipe peer: login, clipboard, file download/serving, shared folders (SG_IO)
     ├── test_upipe_peer.py        # unittest suite for the peer
     └── gobridge_scsi.d           # dtrace tracer for GoBridgeDemon's SCSI tasks (macOS)
 ```

@@ -73,19 +73,36 @@ STATES = {
 
 CMD_LOGIN = 0x01
 CMD_LOGOUT = 0x02
+CMD_GET_DIRECTORY_INFO = 0x04
+CMD_MAKE_NEW_DIRECTORY = 0x07
+CMD_UPLOAD_FILE_DATA = 0x0C
+CMD_UPLOAD_MULTI = 0x12
+CMD_UPLOAD_CONFIRM = 0x13
+CMD_UPLOAD_ABORT = 0x14
+CMD_UPLOAD_CONFIRMATION = 0xA8
+CMD_DIRECTORY_INFO = 0xA2
 CMD_DOWNLOAD_MULTI = 0x10
 CMD_XML = 0x39
 CMD_RESPONSE = 0xA1
 CMD_FILE_DATA = 0xA3
 CMD_DOWNLOAD_FINISHED = 0xA7; CMD_UPLOAD_ERROR = 0xA9
-COMMANDS = {
+COMMANDS = {   # -[<Class> init] setCommandID: values (GoBridgeDemon 152311cb)
     0x00: "Dummy", 0x01: "Login", 0x02: "Logout", 0x04: "GetDirectoryInfo",
     0x06: "DeleteDirectory", 0x07: "MakeNewDirectory", 0x08: "DeleteFile",
-    0x09: "RenameFile", 0x0C: "ChangeFileAttribute", 0x10: "DownloadMultipleFile",
-    0x37: "SyncDynamic", 0x39: "XmlPacket", 0xA1: "ResponseResult",
-    0xA3: "DownloadFileData", 0xA5: "DownloadFileDataFailed",
-    0xA6: "ResponseDownloadMultiFileZeroLength", 0xA7: "DownloadMultiFileFinished",
-    0xA9: "UploadMultiFileError", 0xAB: "DownloadMultiFileException",
+    0x09: "RenameFile", 0x0A: "UploadFile", 0x0B: "DownloadFile", 0x0C: "UploadFileData",
+    0x0D: "UploadFileAbort", 0x0E: "FileTransferFail", 0x0F: "DownloadFileAbort",
+    0x10: "DownloadMultipleFile", 0x11: "DownloadMultipleFileAbort",
+    0x12: "UploadMultipleFile", 0x13: "UploadMultipleFileConfirm",
+    0x14: "UploadMultipleFileAbort", 0x15: "UploadMultipleFileZeroLength",
+    0x34: "SyncDynamic", 0x35: "DownloadMultipleFileDynamic",
+    0x36: "DownloadMultipleFileDynamicExt", 0x37: "ChangeFileAttribute",
+    0x38: "QueryErrorCodeString", 0x39: "XmlPacket", 0xA1: "ResponseResult",
+    0xA2: "DirectoryInfo", 0xA3: "DownloadFileData", 0xA4: "DriveInfo",
+    0xA5: "DownloadFileDataFailed", 0xA6: "ResponseDownloadMultiFileZeroLength",
+    0xA7: "DownloadMultiFileFinished", 0xA8: "UploadMultiFileConfirmation",
+    0xA9: "UploadMultiFileError", 0xAA: "UploadMultiFileConfirmationExt",
+    0xAB: "DownloadMultiFileException", 0xAC: "ErrorCodeStringResult",
+    0xAD: "DomainFolders",
 }
 FILE_DATA_HEADER = 17   # FileDataCommand headerLength: id + 4 x u32
 
@@ -547,6 +564,20 @@ def describe_command(cmd, endian=">"):
             out["session_id"] = struct.unpack(endian + "I", cmd[1:5])[0]
         elif cmd[0] == CMD_UPLOAD_ERROR:
             out.update(decode_upload_error(cmd, endian))
+        elif cmd[0] == CMD_GET_DIRECTORY_INFO:
+            out["path"] = decode_get_directory_info(cmd, endian)
+        elif cmd[0] == CMD_MAKE_NEW_DIRECTORY:
+            out.update(decode_make_new_directory(cmd, endian))
+        elif cmd[0] == CMD_UPLOAD_CONFIRM:
+            out.update(decode_upload_files(cmd, endian))
+        elif cmd[0] == CMD_UPLOAD_MULTI:
+            out.update(decode_upload_multi(cmd, endian))
+        elif cmd[0] == CMD_UPLOAD_FILE_DATA and len(cmd) >= FILE_DATA_HEADER:
+            out.update(zip(("file_id", "total", "index", "data_length"),
+                           struct.unpack(endian + "IIII", cmd[1:FILE_DATA_HEADER])))
+        elif cmd[0] == CMD_DIRECTORY_INFO:
+            d = decode_directory_info(cmd, endian)
+            out.update({"entries": len(d["entries"]), "free_space": d.get("free_space")})
         elif cmd[0] == CMD_DOWNLOAD_MULTI:
             other = "<" if endian == ">" else ">"
             try:                        # the Mac sends big-endian, Linux little
@@ -558,9 +589,16 @@ def describe_command(cmd, endian=">"):
     return out
 
 
-def after_login_commands(clipboard=None, offer=None, download=None, endian="<"):
+def after_login_commands(clipboard=None, offer=None, download=None, endian="<", share=None):
     """Commands to queue once the peer accepts our Login, as (command, why)."""
     out = []
+    if share:
+        drives = []
+        for root in share:
+            st = os.statvfs(root)
+            drives.append((os.path.abspath(root), st.f_blocks * st.f_frsize,
+                           st.f_bavail * st.f_frsize))
+        out.append((encode_drive_list(drives), "drives"))
     if clipboard is not None:
         out.append((encode_clipboard_text(clipboard), "clipboard"))
     if offer:
@@ -569,6 +607,342 @@ def after_login_commands(clipboard=None, offer=None, download=None, endian="<"):
         out.append((encode_download_request(1, list(enumerate(download, start=1)), endian),
                     "download"))
     return out
+
+
+# ------------------------------------------------------- remote browsing
+# Wormhole.app's remote file browser.  A Linux (Android) peer reports its
+# "drives" in an XmlPacket (THMFileManager upNotifyUpipeMessage:); the Mac
+# then lists a folder with GetDirectoryInfo (0x04) and expects the answer
+# THMGBServer handleGetDirectoryInfo: gives: ResponseResult, then DirectoryInfo
+# (0xA2) with fixed 552-byte records (THMRemoteFileWrapper
+# initFromRemoteListData:withOSVersion:), in the sender's byte order.
+
+DIR_RECORD_LEN = 0x228
+DIR_NAME_MAX = DIR_RECORD_LEN - 40   # name bytes after the ten u32 words
+ATTR_HIDDEN, ATTR_DIRECTORY = 0x02, 0x10
+REMOTE_OPERATION_ERROR = 3           # errorCode THMGBServer sends for an unreadable folder
+
+
+def encode_drive_list(drives):
+    """NP_Cmd_Post_Drive_Update_Info: (path, total bytes, free bytes) per drive."""
+    from xml.sax.saxutils import escape
+    lines = "".join(
+        "<Line><NP_Misc_Drive_Letter>%s</NP_Misc_Drive_Letter>"
+        "<NP_Misc_Drive_Total_Space_Number>%d</NP_Misc_Drive_Total_Space_Number>"
+        "<NP_Misc_Drive_Free_Space_Number>%d</NP_Misc_Drive_Free_Space_Number></Line>"
+        % (escape(path), total, free) for path, total, free in drives)
+    return encode_xml_packet(
+        "<ExtraXmlCommand>HookAppService</ExtraXmlCommand><ExtraXmlParam><OTIMSG>"
+        "<NP_Cmd>NP_Cmd_Post_Drive_Update_Info</NP_Cmd><NP_Remote_Request_Info>"
+        "<NP_Misc_Drive_ListMRS>%s</NP_Misc_Drive_ListMRS></NP_Remote_Request_Info>"
+        "</OTIMSG></ExtraXmlParam>" % lines)
+
+
+def encode_get_directory_info(path, endian=">"):
+    raw = path.encode("utf-16-be" if endian == ">" else "utf-16-le")
+    return bytes([CMD_GET_DIRECTORY_INFO]) + struct.pack(endian + "H", len(raw)) + raw
+
+
+def decode_get_directory_info(cmd, endian=">"):
+    """GetDirectoryInfo: 04 <path length u16> <path, UTF-16>; the Mac sends no NUL."""
+    if len(cmd) < 3 or cmd[0] != CMD_GET_DIRECTORY_INFO:
+        raise ValueError("not a GetDirectoryInfo")
+    (n,) = struct.unpack(endian + "H", cmd[1:3])
+    if 3 + n > len(cmd):
+        raise ValueError("GetDirectoryInfo path truncated")
+    return cmd[3:3 + n].decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")
+
+
+def encode_directory_record(name, attrs, size, ctime, atime, mtime, endian="<"):
+    """One 552-byte DirectoryInfo record.  Times are 64-bit Unix seconds and
+    the size 64-bit bytes, each as (low, high) u32 words from a non-Mac sender
+    (the time order was checked live in Wormhole.app)."""
+    raw = name.encode("utf-16-le" if endian == "<" else "utf-16-be")[:DIR_NAME_MAX]
+    words = (attrs, ctime & 0xFFFFFFFF, ctime >> 32, atime & 0xFFFFFFFF, atime >> 32,
+             mtime & 0xFFFFFFFF, mtime >> 32, size & 0xFFFFFFFF, size >> 32, len(raw))
+    return (struct.pack(endian + "10I", *words) + raw).ljust(DIR_RECORD_LEN, b"\0")
+
+
+def encode_directory_info(entries, free_space=None, endian="<"):
+    """DirectoryInfo (0xA2): count u16, records, optional free space u64.
+    entries: (name, attrs, size, ctime, atime, mtime).  The Mac reads the free
+    space only when at least one more byte follows it, hence the pad byte."""
+    entries = list(entries)[:0xFFFF]
+    out = bytes([CMD_DIRECTORY_INFO]) + struct.pack(endian + "H", len(entries))
+    out += b"".join(encode_directory_record(*e, endian=endian) for e in entries)
+    if free_space is not None:
+        out += struct.pack(endian + "Q", free_space) + b"\0"
+    return out
+
+
+def decode_directory_info(cmd, endian="<"):
+    if len(cmd) < 3 or cmd[0] != CMD_DIRECTORY_INFO:
+        raise ValueError("not a DirectoryInfo")
+    (count,) = struct.unpack(endian + "H", cmd[1:3])
+    off, entries = 3, []
+    utf16 = "utf-16-le" if endian == "<" else "utf-16-be"
+    for _ in range(count):
+        rec = cmd[off:off + DIR_RECORD_LEN]
+        if len(rec) != DIR_RECORD_LEN:
+            raise ValueError("DirectoryInfo truncated")
+        w = struct.unpack_from(endian + "10I", rec)
+        entries.append({"name": rec[40:40 + min(w[9], DIR_NAME_MAX)].decode(utf16),
+                        "attrs": w[0], "directory": bool(w[0] & ATTR_DIRECTORY),
+                        "size": (w[8] << 32) | w[7], "ctime": (w[2] << 32) | w[1],
+                        "atime": (w[4] << 32) | w[3], "mtime": (w[6] << 32) | w[5]})
+        off += DIR_RECORD_LEN
+    out = {"entries": entries}
+    if len(cmd) > off + 8:              # as the Mac: only with something after it
+        (out["free_space"],) = struct.unpack(endian + "Q", cmd[off:off + 8])
+    return out
+
+
+def list_directory(path):
+    """(name, attrs, size, ctime, atime, mtime) for each entry; Linux has no
+    portable creation time, so the last-write time stands in."""
+    out = []
+    with os.scandir(path) as it:
+        for e in it:
+            try:
+                st = e.stat()
+            except OSError:
+                continue
+            attrs = ATTR_DIRECTORY if e.is_dir() else 0
+            if e.name.startswith("."):
+                attrs |= ATTR_HIDDEN
+            out.append((e.name, attrs, 0 if attrs & ATTR_DIRECTORY else st.st_size,
+                        int(st.st_mtime), int(st.st_atime), int(st.st_mtime)))
+    return sorted(out)
+
+
+def shared_path(path, roots):
+    """The real path if it lies inside one of roots (after symlinks), else None."""
+    real = os.path.realpath(path)
+    for root in roots:
+        root = os.path.realpath(root)
+        if real == root or real.startswith(root.rstrip("/") + "/"):
+            return real
+    return None
+
+
+class FileResolver:
+    """Which local file answers a peer's path: offered files by their exact
+    path, and regular files inside a shared folder (symlinks resolved)."""
+
+    def __init__(self, offered, roots):
+        self.offered, self.roots = dict(offered), list(roots)
+
+    def get(self, path):
+        if path in self.offered:
+            return self.offered[path]
+        real = shared_path(path, self.roots)
+        return real if real is not None and os.path.isfile(real) else None
+
+
+def encode_make_new_directory(session_id, path, endian=">"):
+    raw = (path + "\0").encode("utf-16-be" if endian == ">" else "utf-16-le")
+    return (bytes([CMD_MAKE_NEW_DIRECTORY]) + struct.pack(endian + "IH", session_id, len(raw))
+            + raw)
+
+
+def decode_make_new_directory(cmd, endian=">"):
+    """MakeNewDirectory: 07 <sessionID u32> <path length u16> <path, UTF-16 + NUL>."""
+    if len(cmd) < 7 or cmd[0] != CMD_MAKE_NEW_DIRECTORY:
+        raise ValueError("not a MakeNewDirectory")
+    session_id, n = struct.unpack(endian + "IH", cmd[1:7])
+    if 7 + n > len(cmd):
+        raise ValueError("MakeNewDirectory path truncated")
+    path = cmd[7:7 + n].decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")
+    return {"session_id": session_id, "path": path}
+
+
+def serve_make_new_directory(cmd, roots, endian="<", request_endian=">"):
+    """Create the folder if it lies inside a share; an existing one is fine.
+    THMGBServer answers with a ResponseResult that carries no session ID."""
+    path = decode_make_new_directory(cmd, request_endian)["path"]
+    parent = shared_path(os.path.dirname(path.rstrip("/")) or "/", roots)
+    target = shared_path(path, roots)
+    try:
+        if parent is None and target is None:
+            raise OSError("not shared")
+        os.makedirs(target or os.path.join(parent, os.path.basename(path.rstrip("/"))),
+                    exist_ok=True)
+    except OSError:
+        return [encode_response(CMD_MAKE_NEW_DIRECTORY, 1, error_code=REMOTE_OPERATION_ERROR,
+                                endian=endian)]
+    return [encode_response(CMD_MAKE_NEW_DIRECTORY, 0, endian=endian)]
+
+
+def _decode_upload_paths(cmd, off, count, endian):
+    """{ <fileID u32> <pathLen u16> <path, UTF-16 + NUL> } * count."""
+    utf16 = "utf-16-be" if endian == ">" else "utf-16-le"
+    files = []
+    for _ in range(count):
+        if off + 6 > len(cmd):
+            raise ValueError("upload file list truncated")
+        file_id, n = struct.unpack(endian + "IH", cmd[off:off + 6])
+        off += 6
+        if off + n > len(cmd):
+            raise ValueError("upload file path truncated")
+        files.append({"file_id": file_id, "path": cmd[off:off + n].decode(utf16).rstrip("\0")})
+        off += n
+    return files
+
+
+def decode_upload_files(cmd, endian=">"):
+    """UploadMultipleFileConfirm (0x13): <multiSessionID u32> <allFileSize u64>
+    <largeFilesCount u16> <count u16> then the destination paths."""
+    if len(cmd) < 17 or cmd[0] != CMD_UPLOAD_CONFIRM:
+        raise ValueError("not an UploadMultipleFileConfirm")
+    multi, total, large, count = struct.unpack(endian + "IQHH", cmd[1:17])
+    return {"multi_session_id": multi, "total_size": total, "large_files": large,
+            "files": _decode_upload_paths(cmd, 17, count, endian)}
+
+
+def decode_upload_multi(cmd, endian=">"):
+    """UploadMultipleFile (0x12): <multiSessionID u32> <count u16> then the
+    destination paths -- no size or large-file count, unlike 0x13."""
+    if len(cmd) < 7 or cmd[0] != CMD_UPLOAD_MULTI:
+        raise ValueError("not an UploadMultipleFile")
+    multi, count = struct.unpack(endian + "IH", cmd[1:7])
+    return {"multi_session_id": multi, "files": _decode_upload_paths(cmd, 7, count, endian)}
+
+
+def encode_upload_confirmation(session_id, existing_ids, free_space_ok=True,
+                               dest_read_only=False, endian="<"):
+    """UploadMultiFileConfirmation (0xA8): readOnly, freeSpace, fileSystem and
+    destRootPathReadOnly flags, sessionID, then the IDs of files that already
+    exist.  The Mac stops the upload when freeSpace is 0 or destRootPathReadOnly 1."""
+    return (bytes([CMD_UPLOAD_CONFIRMATION, 0, 1 if free_space_ok else 0, 0,
+                   1 if dest_read_only else 0])
+            + struct.pack(endian + "II", session_id, len(existing_ids))
+            + b"".join(struct.pack(endian + "I", i) for i in existing_ids))
+
+
+REMOTE_OPERATION_ERROR_TEXT = "Remote operation error"
+
+
+class UploadReceiver:
+    """Server side of an upload into a shared folder (THMGBServer's handlers):
+    0x13 -> 0xA8; 0x12 registers the files (answered only on error); 0x0C
+    pieces are written in order; when every file of a session is complete,
+    DownloadMultiFileFinished (0xA7) carries the session ID; 0x14 aborts."""
+
+    def __init__(self, roots, endian="<", request_endian=">"):
+        self.roots, self.endian, self.req = list(roots), endian, request_endian
+        self.files = {}                 # fileID -> {"path", "multi", "fh"}
+        self.pending = {}               # multiSessionID -> set of fileIDs
+
+    def _error(self, session_id, file_id):
+        return [encode_upload_error(session_id, REMOTE_OPERATION_ERROR, file_id,
+                                    REMOTE_OPERATION_ERROR_TEXT, self.endian)]
+
+    def _drop(self, multi):
+        for fid in self.pending.pop(multi, set()):
+            fh = self.files.pop(fid, {}).get("fh")
+            if fh:
+                fh.close()
+
+    def handle(self, cmd):
+        if not cmd:
+            return []
+        if cmd[0] == CMD_UPLOAD_CONFIRM:
+            req = decode_upload_files(cmd, self.req)
+            reals = [shared_path(f["path"], self.roots) for f in req["files"]]
+            outside = any(r is None for r in reals)
+            existing = [f["file_id"] for f, r in zip(req["files"], reals)
+                        if r is not None and os.path.exists(r)]
+            free_ok = False
+            if not outside and reals:
+                d = os.path.dirname(reals[0])
+                while not os.path.isdir(d):
+                    d = os.path.dirname(d)
+                st = os.statvfs(d)
+                free_ok = st.f_bavail * st.f_frsize >= req["total_size"]
+            return [encode_upload_confirmation(req["multi_session_id"], existing, free_ok,
+                                               outside, self.endian)]
+        if cmd[0] == CMD_UPLOAD_MULTI:
+            req = decode_upload_multi(cmd, self.req)
+            reals = [shared_path(f["path"], self.roots) for f in req["files"]]
+            if any(r is None for r in reals):
+                return [encode_response(CMD_UPLOAD_MULTI, 1, error_code=REMOTE_OPERATION_ERROR,
+                                        endian=self.endian)]
+            multi = req["multi_session_id"]
+            self.pending[multi] = {f["file_id"] for f in req["files"]}
+            for f, real in zip(req["files"], reals):
+                self.files[f["file_id"]] = {"path": real, "multi": multi, "fh": None}
+            return []
+        if cmd[0] == CMD_UPLOAD_FILE_DATA:
+            if len(cmd) < FILE_DATA_HEADER:
+                raise ValueError("UploadFileData truncated")
+            fid, total, index, length = struct.unpack(self.req + "IIII", cmd[1:FILE_DATA_HEADER])
+            entry = self.files.get(fid)
+            if entry is None:
+                return self._error(fid, fid)
+            multi = entry["multi"]
+            try:
+                if entry["fh"] is None:
+                    os.makedirs(os.path.dirname(entry["path"]), exist_ok=True)
+                    entry["fh"] = open(entry["path"], "wb")
+                entry["fh"].write(cmd[FILE_DATA_HEADER:FILE_DATA_HEADER + length])
+                if index < total:
+                    return []
+                entry["fh"].close()
+            except OSError:
+                self._drop(multi)
+                return self._error(multi, fid)
+            del self.files[fid]
+            self.pending[multi].discard(fid)
+            if self.pending[multi]:
+                return []
+            del self.pending[multi]
+            return [encode_download_finished(multi, self.endian)]
+        if cmd[0] == CMD_UPLOAD_ABORT and len(cmd) >= 5:
+            self._drop(struct.unpack(self.req + "I", cmd[1:5])[0])
+            return []
+        return []
+
+
+def server_replies(cmd, roots, resolver, uploads=None):
+    """Replies, as (command, why), to a request the peer sent our server side.
+    Only shared folders are browsed or changed, only resolvable files served.
+    A request we cannot parse gets ResponseResult(cmd, 1) instead of an exception."""
+    if not cmd:
+        return []
+    try:
+        return _server_replies(cmd, roots, resolver, uploads)
+    except ValueError:
+        return [(encode_response(cmd[0], 1, error_code=REMOTE_OPERATION_ERROR, endian="<"),
+                 "error")]
+
+
+def _server_replies(cmd, roots, resolver, uploads):
+    if roots and cmd[0] == CMD_GET_DIRECTORY_INFO:
+        return [(r, "browse") for r in serve_get_directory_info(cmd, roots)]
+    if roots and cmd[0] == CMD_MAKE_NEW_DIRECTORY:
+        return [(r, "mkdir") for r in serve_make_new_directory(cmd, roots)]
+    if roots and uploads is not None and cmd[0] in (
+            CMD_UPLOAD_CONFIRM, CMD_UPLOAD_MULTI, CMD_UPLOAD_FILE_DATA, CMD_UPLOAD_ABORT):
+        return [(r, "upload") for r in uploads.handle(cmd)]
+    if cmd[0] == CMD_DOWNLOAD_MULTI and (resolver.offered or resolver.roots):
+        return [(r, "serve") for r in serve_download(cmd, resolver)]
+    return []
+
+
+def serve_get_directory_info(cmd, roots, endian="<", request_endian=">"):
+    """Answer GetDirectoryInfo for folders inside roots, as THMGBServer does."""
+    path = decode_get_directory_info(cmd, request_endian)
+    real = shared_path(path, roots)
+    try:
+        if real is None:
+            raise OSError("not shared")
+        entries = list_directory(real)
+        free = os.statvfs(real)
+    except OSError:
+        return [encode_response(CMD_GET_DIRECTORY_INFO, 1, error_code=REMOTE_OPERATION_ERROR,
+                                endian=endian)]
+    return [encode_response(CMD_GET_DIRECTORY_INFO, 0, endian=endian),
+            encode_directory_info(entries, free.f_bavail * free.f_frsize, endian)]
 
 
 # ------------------------------------------------------------------ SG_IO
@@ -627,6 +1001,10 @@ def main(argv):
                          "(CB_Format_File, repeatable) and serve it when the peer pastes "
                          "it; only offered files are served; exits once a request is "
                          "answered")
+    ap.add_argument("--share", metavar="LOCAL_DIR", action="append",
+                    help="with --login: show this folder as a drive in Wormhole.app's remote "
+                         "browser, list its folders and serve its files (repeatable); runs "
+                         "for --seconds")
     ap.add_argument("--download", metavar="PEER_PATH", action="append",
                     help="with --login: ask the peer to send this file (repeatable); "
                          "saved as download_<n>.bin in --out; exits when the peer "
@@ -635,8 +1013,9 @@ def main(argv):
                     help="byte order for --download fields (default little: the Mac decodes "
                          "a Linux peer little-endian; big crashed its daemon)")
     args = ap.parse_args(argv)
-    if (args.clipboard is not None or args.download or args.offer) and not args.login:
-        ap.error("--clipboard, --offer and --download need --login")
+    if (args.clipboard is not None or args.download or args.offer or args.share) \
+            and not args.login:
+        ap.error("--clipboard, --offer, --share and --download need --login")
     os_byte = {v: k for k, v in OS_NAMES.items()}[args.os]
 
     os.makedirs(args.out, exist_ok=True)
@@ -655,6 +1034,9 @@ def main(argv):
     started = set()                     # file IDs whose download file we have opened
     # Paths as the peer will ask for them -> local files; only these are served.
     offered = {os.path.abspath(p): os.path.abspath(p) for p in args.offer or []}
+    shares = [os.path.abspath(d) for d in args.share or []]
+    resolver = FileResolver(offered, shares)
+    uploads = UploadReceiver(shares)
     served = False                      # answered a DownloadMultipleFile with 0xA7/0xA9
     download_done = False               # 0xA7 or 0xA9 received: stop once txq drains
     end = time.time() + args.seconds
@@ -712,13 +1094,18 @@ def main(argv):
                     desc = describe_command(cmd)
                     emit({"event": "command", **desc, "cmd_head": cmd[:64].hex()})
                     print("command", desc, flush=True)
+                    # The peer logged out (e.g. Wormhole.app restarted): log in
+                    # again so the after-login commands (drive list) go out anew.
+                    if args.login and cmd[:1] == bytes([CMD_LOGOUT]):
+                        after_login_sent = False
+                        queue(encode_login(args.login, os_byte), "relogin")
                     if args.login and cmd[:1] == bytes([CMD_LOGIN]):
                         queue(encode_response(CMD_LOGIN, 0, os_byte), "login-response")
                     # The peer's ResponseResult to our Login = we are logged in.
                     if cmd[:2] == bytes([CMD_RESPONSE, CMD_LOGIN]) and not after_login_sent:
                         after_login_sent = True
                         for c, why in after_login_commands(args.clipboard, args.offer,
-                                                           args.download, endian):
+                                                           args.download, endian, shares):
                             queue(c, why)
                     if cmd[:1] == bytes([CMD_FILE_DATA]) and "decode_error" not in desc:
                         piece = decode_file_data(cmd)
@@ -727,10 +1114,10 @@ def main(argv):
                         with open(path, "ab" if piece["file_id"] in started else "wb") as f:
                             f.write(piece["data"])
                         started.add(piece["file_id"])
-                    if offered and cmd[:1] == bytes([CMD_DOWNLOAD_MULTI]):
-                        for reply in serve_download(cmd, offered):
-                            queue(reply, "serve", "<")
-                        served = True
+                    for reply, why in server_replies(cmd, shares, resolver, uploads):
+                        queue(reply, why, "<")
+                        if why == "serve":
+                            served = True
                     if args.download and cmd[:1] in (bytes([CMD_DOWNLOAD_FINISHED]),
                                                      bytes([CMD_UPLOAD_ERROR])):
                         download_done = True
@@ -746,7 +1133,7 @@ def main(argv):
                     break
                 txq.pop(0)
             # Stop once the request we were waiting for is answered and sent.
-            if not txq and (served if offered else download_done):
+            if not txq and not shares and (served if offered else download_done):
                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:
