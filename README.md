@@ -30,7 +30,13 @@ When both ends are plugged into two PCs, each PC runs the bundled *Wormhole* / *
 | SCSI (If 0) | Standard Bulk-Only, Bulk-Only CBW (`USBC`) / CSW (`USBS`). INQUIRY returns PDT=5 (cd/dvd), version `0x00` (no conformance claimed), vendor `j5create`, product `WormholeSwitch`, rev `2.00`. Minimal command set: `TEST UNIT READY`, `INQUIRY`, `REQUEST SENSE`, `READ CAPACITY(10)`, `READ(10)`. `GET EVENT STATUS NOTIFICATION (0x4A)` and `READ CAPACITY(16) (0x9E)` return CHECK CONDITION / INVALID OPCODE. |
 | Capacity anomaly | `READ CAPACITY(10)` returns last LBA 1592 / 2048 B blocks (3.1 MiB), which is the usable size of the ISO9660 volume labelled `WORMHOLE`. Linux exposes `/dev/srX` as 31744×512 B (15.5 MiB) because `sr` takes `max(READ CAPACITY, last_written)` and the firmware's track information reports 7936 blocks. See `docs/capacity-anomaly.md`. |
 | HID (If 1/2) | Boot Mouse (52 B report descriptor) and Boot Keyboard (67 B). Appear as `hidraw*` + input events. Idle until peer software injects reports — see `docs/transport.md`. |
+| Vendor HID | The peer's input travels as a 16-byte vendor CDB on the SCSI pipe, `D9 '3'/'4'/'6' <12 payload> O T` (mouse / keyboard / multimedia); the cable replays it on the other host's EP3/EP4. See `docs/transport.md`. |
+| UPipe | File and clipboard channel on the same SCSI pipe: `0xD8` status poll, `0xD9 0x28` fetch / `0xD9 0x2A` send of 64 KiB packets carrying GoBridge commands (login, clipboard text/files/images, file download and upload, shared-folder browsing and file operations). See `docs/upipe-protocol.md`. |
 | ISO payload | `autorun.inf` → `SKLoader.exe` (embedded UPX DLL resource) + `Deployment/GSDD.lst`/`GSDD.zz`, macOS `Wormhole.app` → `WormholeShell` → `Wormhole.tgz` → `GoBridgeDemon` + `KMKeyMouse`/`KMClipboard`/`OTiTransfer`. See `docs/iso-payload.md` and `docs/pe-analysis.md`. |
+
+## Status
+
+Enumeration, SCSI, the ISO payload and the UPipe protocol are done (v0.1–v0.4): `tools/upipe_peer.py` acts as a GoBridge peer on Linux against the Mac software. In progress: Windows host parity (v0.5), starting from a Windows KVM guest. See [`ROADMAP.md`](ROADMAP.md) and the tracking issue [#23](https://github.com/rtk94/wormhole-switch-re/issues/23).
 
 See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and CBW/CSW breakdown.
 
@@ -78,11 +84,11 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
 │   └── wormhole_bus3_live_2026-11-08_1755.pcap
 └── tools/
     ├── wormhole_parse.py         # stdlib-only usbmon pcap parser (CBW/CSW/SCSI + vendor 0xD9 HID + boot HID reports)
-    ├── test_wormhole_parse.py    # unittest suite for the parser (72 tests)
+    ├── test_wormhole_parse.py    # unittest suite for the parser
     ├── filter_usbmon.py          # keep one device's records from a raw usbmon pcap (sanitising)
-    ├── test_filter_usbmon.py     # unittest suite for the filter (9 tests)
+    ├── test_filter_usbmon.py     # unittest suite for the filter
     ├── peer_rerun_send.py        # logged send driver for the peer->local re-run (sg_raw and SG_IO)
-    ├── test_peer_rerun_send.py   # unittest suite for the driver (4 tests)
+    ├── test_peer_rerun_send.py   # unittest suite for the driver
     ├── upipe_peer.py             # Linux UPipe peer: login, clipboard, file download/serving, shared folders (SG_IO)
     ├── test_upipe_peer.py        # unittest suite for the peer
     └── gobridge_scsi.d           # dtrace tracer for GoBridgeDemon's SCSI tasks (macOS)

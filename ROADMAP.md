@@ -58,16 +58,16 @@ The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and veri
 
 ## 🔄 v0.5 — Windows host software parity (In progress) — **CURRENT**
 
-macOS GoBridgeDemon is analysed to function level (`docs/mac-gobridge.md`). Windows path (`SKLoader.exe` → embedded DLL → `OTiTransfer`) is mapped at import/resource level (`docs/pe-analysis.md`). GSDD container format is reversed (`docs/gsdd.md`).
+macOS GoBridgeDemon is analysed to function level (`docs/mac-gobridge.md`). On Windows, `SKLoader.exe` and its embedded DLL are analysed (`docs/pe-analysis.md`), but that DLL is `ArchiveTreeLib.dll`, the `GSDD` extractor, with no USB code. The cable-facing binaries (`Wormhole.exe`, `LinkEngKM.exe`, `2208KM_HID.dll`, …) are in `GSDD.zz`, encrypted with an `OTiEncrypt.dll` that no shipped file contains (`docs/gsdd.md`). Installing the software in a Windows KVM guest with the cable passed through (`docs/reproduction.md` §6.6) writes them out, and usbmon on the Linux host records the guest's traffic.
 
-- [x] `GSDD.zz` / `GSDD.lst` container format — encryption/compression, role in SKLoader deployment
-- [ ] Deep decompile embedded DLL (UPX unpacked, 1,849 functions) — trace `OTi_*` exports to SCSI/HID calls
-- [ ] Map Windows HID injection: `SendInput` / `HID` API usage vs macOS `CGEvent` path
-- [ ] Map Windows file/clipboard: `OTiTransfer` → `DeviceIoControl` / `IOCTL_SCSI_PASS_THROUGH` vs macOS `SCSITask`
+- [x] `GSDD.zz` / `GSDD.lst` container format — encryption/compression, role in SKLoader deployment (#10)
+- [x] Embedded DLL unpacked and decompiled: `ArchiveTreeLib.dll` (OTiArchive), archive/GUI/registry code, no `DeviceIoControl` (`docs/pe-analysis.md`)
 - [x] Analyse `Wormhole.app` UI (macOS frontend) — `docs/wormhole-app-ui.md` (#12)
-- [ ] Cross-reference macOS/Windows packet formats for parity (same `0xD9` HID? same UPipe?)
+- [ ] Recover the Windows binaries from a VM install, with `OTiEncrypt.dll` if it is written out (#48)
+- [ ] Function-level analysis: SCSI pass-through, `SendInput`/hooks vs macOS `CGEvent`, UPipe handlers (#49)
+- [ ] Windows peer capture: `0xD9` HID and UPipe parity, Windows-only clipboard formats (DIB, RTF, HTML, multiple images) (#50)
 
-**Deliverable:** `docs/windows-gobridge.md` (parallel to `mac-gobridge.md`)
+**Deliverable:** `docs/windows-gobridge.md` (parallel to `mac-gobridge.md`), Windows results in `docs/upipe-protocol.md`
 
 ---
 
@@ -79,20 +79,21 @@ Host-side observations resolved several firmware-adjacent questions without need
 - [x] Multimedia HID type `'6'` wire payload: all-zero probe proves framing; `payload[0]` = Consumer usage (inferred from dylib); 6 usages via `'6'`, 6 via `'4'`
 - [x] 15-byte CDB truncation: host-side short send (missing pad byte), not usbmon, not firmware — wire proof in `docs/15-byte-cdb-truncation.md`
 - [x] Peer forwarding confirmed; `bus3_live2` orphan x=+60 attributed to peer-side injection through cable by inference (`docs/issue-15-mouse60-orphan.md`)
-- [ ] Peer-to-peer data channel internals: exact firmware routing between housings (not visible from one host)
-- [ ] Firmware extraction / analysis (if feasible — JTAG/SWD, DFU, or vendor update mechanism)
+- [ ] Peer-to-peer data channel internals: exact firmware routing between housings (not visible from one host) (#14)
+- [ ] Firmware extraction / analysis (if feasible — JTAG/SWD, DFU, or vendor update mechanism) (#14)
 
-**Approach remaining:** Two-end simultaneous capture (usbmon on both hosts) + host-software logging correlation. Firmware dump is stretch goal.
+**Approach remaining:** Two-end simultaneous capture + host-software logging correlation. Both ends can go into one Linux host, one passed to a KVM guest, so one usbmon clock covers both (`docs/reproduction.md` §6.6). Firmware dump is stretch goal.
 
 ---
 
 ## 🎯 v1.0 — Stable reference release
 
-- [ ] Complete protocol specification: USB/SCSI/HID/UPipe in one document (`docs/protocol-spec.md`)
-- [ ] Parser (`tools/wormhole_parse.py`) covers all observed packet types with 100% test coverage
-- [ ] Reproduction guide (`docs/reproduction.md`) validated on clean Linux/macOS/Windows hosts
-- [ ] All captures in `captures/` are filtered, documented, and parseable by the reference parser
-- [ ] Cross-platform host-software analysis parity (macOS + Windows)
+- [ ] Remaining Mac-side UPipe questions: aborts, `0x37`, error codes, unused command IDs (#51)
+- [ ] Complete protocol specification: USB/SCSI/HID/UPipe in one document (`docs/protocol-spec.md`) (#52)
+- [ ] Parser (`tools/wormhole_parse.py`) covers all observed packet types with 100% test coverage (#53)
+- [ ] Reproduction guide (`docs/reproduction.md`) validated on clean Linux/macOS/Windows hosts (#54)
+- [ ] All captures in `captures/` are filtered, documented, and parseable by the reference parser (#54)
+- [ ] Cross-platform host-software analysis parity (macOS + Windows) (v0.5)
 - [ ] `README.md`, `CONTRIBUTING.md`, `ROADMAP.md`, `LICENSE` complete
 - [x] Architecture diagram (`architecture.html`) in repo root
 - [ ] Tag `v1.0` — reference frozen for downstream implementers (emulators, KVM switches, protocol translators)
@@ -107,15 +108,20 @@ Host-side observations resolved several firmware-adjacent questions without need
 | v0.2 | SCSI / Mass Storage | ✅ Done | — |
 | v0.3 | ISO payload & host inventory | ✅ Done | — |
 | v0.4 | UPipe protocol | ✅ Done | — |
-| v0.5 | **Windows host parity** | 🔄 **In progress** | Windows peer capture |
-| v0.6 | Firmware internals | 🔄 Partially resolved | Long-term |
-| v1.0 | Stable reference release | 📋 Planned | When v0.4–0.6 converge |
+| v0.5 | **Windows host parity** | 🔄 **In progress** | Windows binaries from a VM install (#48) |
+| v0.6 | Firmware internals | 🔄 Partially resolved | Long-term (#14) |
+| v1.0 | Stable reference release | 📋 Planned | When v0.5 lands and #51–#54 close |
+
+GitHub milestones use the same names; [#23](https://github.com/rtk94/wormhole-switch-re/issues/23) tracks the issue-level view.
 
 ---
 
-## What comes after v0.4
+## Next
 
-v0.4 is done (#9). The capture method is in `docs/upipe-protocol.md` (Linux peer tool + Mac dtrace tracer). Next:
+v0.4 is done (#9). Critical path:
 
-1. Repeat against a Windows peer for parity (v0.5), including the Windows-only clipboard formats (DIB, RTF, HTML, multiple images).
-2. Still unobserved from the Mac, listed in `docs/upipe-protocol.md` § Open questions: the aborts (`0x11`, `0x14`), `0x37` ChangeFileAttribute, drag-and-drop.
+1. **#48** — install the Windows software in a KVM guest (`docs/reproduction.md` §6.6) and recover the binaries `GSDD.zz` keeps encrypted.
+2. **#49** (static analysis) and **#50** (Windows peer capture), in parallel once #48 lands.
+3. **#52** protocol spec, then **#53**, **#54** and the `v1.0` tag.
+
+Any time: **#51** on the existing Mac rig, and **#14** with both ends on one host.
