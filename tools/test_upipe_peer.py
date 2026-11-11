@@ -385,6 +385,75 @@ class TestWindowsPeer(unittest.TestCase):
             u.decode_multiple_file_package(pkg, "<")
 
 
+class TestDomainFoldersDriveInfo(unittest.TestCase):
+    """DomainFolders (0xad) and DriveInfo (0xa4), sent after Login between a
+    Mac and a Windows peer (2026-11-11 capture, #50).  Hand-built bytes follow
+    the captured layouts; paths are stand-ins."""
+
+    MAC_FOLDERS = [(0, "/Users/u/Desktop"), (1, "/Users/u/Documents"),
+                   (2, "/var/folders/x/T/GBMiscInfoFile.xml")]
+    WIN_FOLDERS = [(0, "C:\\Users\\u\\Desktop"), (4, "C:\\Users\\u\\Pictures")]
+
+    def test_domain_folders_mac_layout(self):
+        # ad <length u32 LE> <count u8> {<0x0ff0 << 16 | type, u32> <len u32> <path>}
+        # The Mac writes the u32s big-endian, paths UTF-16BE with a NUL, and a
+        # length that covers the entries only.
+        entries = b"".join(struct.pack(">II", 0x0FF00000 | t, len(p.encode("utf-16-be")) + 2)
+                           + p.encode("utf-16-be") + b"\0\0" for t, p in self.MAC_FOLDERS)
+        cmd = bytes([0xAD]) + struct.pack("<I", len(entries)) + bytes([3]) + entries
+        self.assertEqual(u.encode_domain_folders(self.MAC_FOLDERS, ">"), cmd)
+        d = u.describe_command(cmd, ">")
+        self.assertNotIn("decode_error", d)
+        self.assertEqual([(f["type"], f["name"], f["path"]) for f in d["folders"]],
+                         [(0, "Desktop", "/Users/u/Desktop"),
+                          (1, "Documents", "/Users/u/Documents"),
+                          (2, "MiscInfoFile", "/var/folders/x/T/GBMiscInfoFile.xml")])
+
+    def test_domain_folders_windows_layout(self):
+        # Windows: little-endian, no NUL, and the length also counts the count byte.
+        entries = b"".join(struct.pack("<II", 0x0FF00000 | t, len(p.encode("utf-16-le")))
+                           + p.encode("utf-16-le") for t, p in self.WIN_FOLDERS)
+        cmd = bytes([0xAD]) + struct.pack("<I", len(entries) + 1) + bytes([2]) + entries
+        self.assertEqual(u.encode_domain_folders(self.WIN_FOLDERS, "<"), cmd)
+        for endian in ("<", ">"):
+            d = u.describe_command(cmd, endian)
+            self.assertNotIn("decode_error", d)
+            self.assertEqual([(f["type"], f["name"], f["path"]) for f in d["folders"]],
+                             [(0, "Desktop", "C:\\Users\\u\\Desktop"),
+                              (4, "Pictures", "C:\\Users\\u\\Pictures")])
+
+    def test_domain_folders_truncated(self):
+        cmd = u.encode_domain_folders(self.WIN_FOLDERS, "<")
+        with self.assertRaises(ValueError):
+            u.decode_domain_folders(cmd[:-2], "<")
+
+    def test_drive_info_mac_volumes(self):
+        # a4 <count u16 LE> {<entry len u16> <name len u16> <name> <path len u16> <path>}
+        # big-endian, UTF-16BE with NUL: the Mac's one volume, "Mac" at "/".
+        cmd = bytes.fromhex("a4 0100 0012 0008 004d0061006300 00 0004 002f0000".replace(" ", ""))
+        self.assertEqual(len(cmd), 21)
+        self.assertEqual(u.encode_drive_info_volumes([("Mac", "/")], ">"), cmd)
+        d = u.describe_command(cmd, ">")
+        self.assertNotIn("decode_error", d)
+        self.assertEqual(d["drives"], [{"name": "Mac", "path": "/"}])
+
+    def test_drive_info_windows_letters(self):
+        # a4 <count u16 LE> {<letter> <type>}: Windows' drive letters.
+        cmd = bytes.fromhex("a4030043024404450 4".replace(" ", ""))
+        self.assertEqual(u.encode_drive_info_letters([("C", 2), ("D", 4), ("E", 4)]), cmd)
+        for endian in ("<", ">"):
+            d = u.describe_command(cmd, endian)
+            self.assertNotIn("decode_error", d)
+            self.assertEqual(d["drives"], [{"letter": "C", "type": 2},
+                                           {"letter": "D", "type": 4},
+                                           {"letter": "E", "type": 4}])
+
+    def test_drive_info_truncated(self):
+        cmd = u.encode_drive_info_volumes([("Mac", "/")], ">")
+        with self.assertRaises(ValueError):
+            u.decode_drive_info(cmd[:-1], ">")
+
+
 class TestImageFetcher(unittest.TestCase):
     """--save-clipboard-images: fetch each image the Mac copies."""
 

@@ -221,12 +221,12 @@ sends little-endian ([Layer 4](#layer-4-commands)). Paths are UTF-16.
 | `handleRequestResponse:` | `0xa1` | see [ResponseResult](#responseresult-0xa1) | — | live |
 | `handleDirectoryInfo:` | `0xa2` | `<count u16> <552-byte records> <free u64> <pad>` | — | live |
 | `handleDownloadFileData:` | `0xa3` | as `0x0c` | — | live, both ways |
-| `handleDriveInfo:` | `0xa4` | not decoded | — | not observed (a Linux peer uses the XML drive list) |
+| `handleDriveInfo:` | `0xa4` | see [DomainFolders and DriveInfo](#domainfolders-0xad-and-driveinfo-0xa4) | none | live, Mac ↔ Windows (a Linux peer uses the XML drive list) |
 | `handleDownloadFileZero:` | `0xa6` | `<session u32> <count u16> <fileIDs>` | — | not observed: the Mac sends an empty file as one empty `0xa3` |
 | `handleUploadDownloadFinish:` | `0xa7` | `<session u32>` | — | live, both ways |
 | `handleUploadMultipleFileConfirmation` | `0xa8` | `<4 flags> <session u32> <existCount u32> <IDs>` | — | live |
 | `handleUploadMultiFileError` | `0xa9` | `<session u32> <code u32> <fileID u32> <tag 6> <len u32> <string>` | — | live, both ways |
-| `handleDomainFolders:` | `0xad` | not decoded | — | not observed (sent to Windows/Mac peers only) |
+| `handleDomainFolders:` | `0xad` | see [DomainFolders and DriveInfo](#domainfolders-0xad-and-driveinfo-0xa4) | none | live, Mac ↔ Windows |
 | `handleTransferFailed:` | ? | not decoded | — | not observed |
 
 Sections: [Login](#login-0x01), [clipboard](#xmlpacket-0x39-clipboard),
@@ -425,6 +425,43 @@ remaining files nor `0xa7`. Other IDs from the decompile, not seen live:
 (`sessionID u32, count u16, fileIDs`), `0xab` DownloadMultiFileException.
 `0x0b` DownloadFile has a class but is not in `commandClassForCommandID:`, so
 the Mac cannot receive it.
+
+### DomainFolders (`0xad`) and DriveInfo (`0xa4`)
+
+Right after the Login exchange, a Mac and a Windows peer each send a
+DomainFolders and a DriveInfo (`forwardDomainFoldersInfoToRemote`; first seen
+2026-11-11, #50). A Linux peer gets neither from the Mac.
+
+```
+ad <length u32 LE> <count u8> { <0x0ff0 << 16 | type, u32> <path length u32> <path> }
+```
+
+| Type | Folder |
+|---|---|
+| 0 | Desktop |
+| 1 | Documents |
+| 2 | the sender's misc-info file (`GBMiscInfoFile.xml` in the Mac's temp folder, `GSMiscInfo.dat` in Windows' `%TEMP%`) |
+| 3 | Music |
+| 4 | Pictures |
+
+The Mac writes the two u32s per entry big-endian and its paths UTF-16BE with
+a NUL, and its length covers the entries. Windows writes them little-endian
+with no NUL, and its length also counts the count byte. The length is
+little-endian from both. Windows sent its folders in the order 0, 1, 4, 3, 2
+(Desktop, Documents and Pictures under OneDrive); the Mac's order was 0, 1,
+3, 4, 2.
+
+DriveInfo has two forms, both starting `a4 <count u16 LE>`:
+
+- The Mac sends volumes: `{<entry length u16> <name length u16> <name>
+  <path length u16> <path>}`, big-endian, UTF-16BE with NULs; the entry
+  length counts itself. Observed: one volume, `Mac` at `/`.
+- Windows sends drive letters: `{<letter> <type>}`, one byte each. Observed:
+  `C` 2, `D` 4, `E` 4 (the guest's install ISO and the Wormhole CD). The
+  types fit `GetDriveType() − 1` (fixed 3, CD-ROM 5); unconfirmed.
+
+`upipe_peer.py` has encoders and decoders for both commands; the parser
+recognises the DriveInfo form by its shape.
 
 ### MultipleFilePackage (`0x3a`): several commands in one
 
@@ -704,8 +741,8 @@ Mac-side items are tracked in #51; the Windows formats and parity in #50.
 - The other clipboard formats (`CB_Format_DIB`, `CB_Format_MutipleImages`,
   RTF, PDF): expected from Windows peers; text, file, TIFF and (from Windows)
   `HTML Format` seen.
-- DomainFolders (`0xad`) and DriveInfo (`0xa4`): sent both ways in the
-  Windows session, layouts not decoded.
+- What the Mac does with a Windows peer's DomainFolders (Finder sidebar
+  entries?) and the misc-info file it points to.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
 - The Windows-only CDBs above (`0xE1`, `d8 00 05`, `d8 01 04`, `d9 3a`).
 - Windows peer parity: the deliberate capture in #50.

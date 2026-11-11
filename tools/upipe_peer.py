@@ -90,6 +90,8 @@ CMD_DOWNLOAD_MULTI = 0x10
 CMD_XML = 0x39
 CMD_PACKAGE = 0x3A
 CMD_CHANGE_ATTRIBUTE = 0x37
+CMD_DRIVE_INFO = 0xA4
+CMD_DOMAIN_FOLDERS = 0xAD
 CMD_RESPONSE = 0xA1
 CMD_FILE_DATA = 0xA3
 CMD_DOWNLOAD_FINISHED = 0xA7; CMD_UPLOAD_ERROR = 0xA9
@@ -707,6 +709,97 @@ def decode_upload_error(cmd, endian=">"):
             "error": raw.decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")}
 
 
+# ------------------------------------------- DomainFolders (0xad), DriveInfo (0xa4)
+# Sent right after Login between a Mac and a Windows peer
+# (forwardDomainFoldersInfoToRemote; 2026-11-11 capture, #50).
+
+DOMAIN_FOLDER_TAG = 0x0FF0          # high half of each entry's first u32
+DOMAIN_FOLDER_NAMES = {0: "Desktop", 1: "Documents", 2: "MiscInfoFile", 3: "Music",
+                       4: "Pictures"}
+
+
+def encode_domain_folders(folders, endian=">"):
+    """DomainFolders (0xad): ad <length u32 LE> <count u8> {<tag u32> <len u32> <path>}.
+
+    tag is 0x0ff0 << 16 | folder type (0 Desktop, 1 Documents, 2 the peer's
+    misc-info file, 3 Music, 4 Pictures).  As captured: the Mac writes the u32s
+    big-endian and NUL-terminates its paths, and its length covers the
+    entries; Windows writes little-endian without NULs, and its length also
+    counts the count byte.  The length itself is little-endian from both."""
+    entries = b""
+    for kind, path in folders:
+        raw = path.encode(_utf16(endian)) + (b"\0\0" if endian == ">" else b"")
+        entries += struct.pack(endian + "II", DOMAIN_FOLDER_TAG << 16 | kind, len(raw)) + raw
+    length = len(entries) + (0 if endian == ">" else 1)
+    return bytes([CMD_DOMAIN_FOLDERS]) + struct.pack("<I", length) + bytes([len(folders)]) + entries
+
+
+def decode_domain_folders(cmd, endian=">"):
+    if len(cmd) < 6 or cmd[0] != CMD_DOMAIN_FOLDERS:
+        raise ValueError("not a DomainFolders")
+    (length,) = struct.unpack("<I", cmd[1:5])
+    off, folders = 6, []
+    for _ in range(cmd[5]):
+        if off + 8 > len(cmd):
+            raise ValueError("DomainFolders entry %d truncated" % len(folders))
+        tag, n = struct.unpack(endian + "II", cmd[off:off + 8])
+        if tag >> 16 != DOMAIN_FOLDER_TAG:
+            raise ValueError("DomainFolders entry %d tag 0x%08x" % (len(folders), tag))
+        if off + 8 + n > len(cmd):
+            raise ValueError("DomainFolders entry %d path truncated" % len(folders))
+        kind = tag & 0xFFFF
+        folders.append({"type": kind, "name": DOMAIN_FOLDER_NAMES.get(kind, "unknown"),
+                        "path": cmd[off + 8:off + 8 + n].decode(_utf16(endian)).rstrip("\0")})
+        off += 8 + n
+    return {"length_field": length, "folders": folders}
+
+
+def encode_drive_info_volumes(volumes, endian=">"):
+    """DriveInfo (0xa4) as the Mac sends it: a4 <count u16 LE>
+    {<entry length u16> <name length u16> <name> <path length u16> <path>},
+    the u16s in the sender's order, UTF-16 with a NUL; entry length counts
+    itself."""
+    out = bytes([CMD_DRIVE_INFO]) + struct.pack("<H", len(volumes))
+    for name, path in volumes:
+        n = name.encode(_utf16(endian)) + b"\0\0"
+        p = path.encode(_utf16(endian)) + b"\0\0"
+        out += (struct.pack(endian + "HH", 6 + len(n) + len(p), len(n)) + n
+                + struct.pack(endian + "H", len(p)) + p)
+    return out
+
+
+def encode_drive_info_letters(drives):
+    """DriveInfo (0xa4) as Windows sends it: a4 <count u16 LE> {<letter> <type>}.
+    Observed types: 2 for C:, 4 for the two CD-ROM drives."""
+    return (bytes([CMD_DRIVE_INFO]) + struct.pack("<H", len(drives))
+            + b"".join(bytes([ord(letter), kind]) for letter, kind in drives))
+
+
+def decode_drive_info(cmd, endian=">"):
+    """Either DriveInfo form; the letter form is recognised by its shape."""
+    if len(cmd) < 3 or cmd[0] != CMD_DRIVE_INFO:
+        raise ValueError("not a DriveInfo")
+    (count,) = struct.unpack("<H", cmd[1:3])
+    pairs = cmd[3:]
+    if len(pairs) == 2 * count and all(0x41 <= pairs[i] <= 0x5A for i in range(0, len(pairs), 2)):
+        return {"drives": [{"letter": chr(pairs[i]), "type": pairs[i + 1]}
+                           for i in range(0, len(pairs), 2)]}
+    off, drives = 3, []
+    for _ in range(count):
+        if off + 4 > len(cmd):
+            raise ValueError("DriveInfo entry %d truncated" % len(drives))
+        entry, n = struct.unpack(endian + "HH", cmd[off:off + 4])
+        if off + 6 + n > len(cmd):
+            raise ValueError("DriveInfo entry %d name truncated" % len(drives))
+        (m,) = struct.unpack(endian + "H", cmd[off + 4 + n:off + 6 + n])
+        if entry != 6 + n + m or off + entry > len(cmd):
+            raise ValueError("DriveInfo entry %d length mismatch" % len(drives))
+        drives.append({"name": cmd[off + 4:off + 4 + n].decode(_utf16(endian)).rstrip("\0"),
+                       "path": cmd[off + 6 + n:off + entry].decode(_utf16(endian)).rstrip("\0")})
+        off += entry
+    return {"drives": drives}
+
+
 def describe_command(cmd, endian=">"):
     """Decode a command for logging.
 
@@ -741,6 +834,10 @@ def _command_fields(cmd, endian):
         out.update(decode_clipboard(decode_xml_packet(cmd, endian)))
     elif cmd[0] == CMD_CHANGE_ATTRIBUTE:
         out.update(decode_change_file_attribute(cmd, endian))
+    elif cmd[0] == CMD_DOMAIN_FOLDERS:
+        out.update(decode_domain_folders(cmd, endian))
+    elif cmd[0] == CMD_DRIVE_INFO:
+        out.update(decode_drive_info(cmd, endian))
     elif cmd[0] == CMD_FILE_DATA:
         d = decode_file_data(cmd, endian)
         d.pop("data")
