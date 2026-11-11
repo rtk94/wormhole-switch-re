@@ -250,13 +250,15 @@ Replies, server → requester, in order:
 | ID | Command | Layout (big-endian) |
 |---|---|---|
 | `0xa1` | ResponseResult | `requestCommand 0x10`, `sessionID = multiSessionID`, result 0 (34 bytes) |
-| `0xa3` | DownloadFileData | `a3 <fileID u32> <totalCount u32> <currentIndex u32> <dataLength u32> <data>`; 17-byte header, at most `0x800000` data bytes per command; `currentIndex` starts at 1 |
+| `0xa3` | DownloadFileData | `a3 <fileID u32> <totalCount u32> <currentIndex u32> <dataLength u32> <data>`; 17-byte header, at most `0x800000` (8 MiB) data bytes per command, so a 20 MiB file arrives as 3 pieces (`totalCount` 3, `currentIndex` 1–3) |
 | `0xa7` | DownloadMultiFileFinished | `a7 <multiSessionID u32>` |
+| `0xa9` | UploadMultiFileError (instead of `0xa3`/`0xa7` when a file is missing) | `a9 <sessionID u32> <errorCode u32> <errorFileID u32> <tag 6 B> <errorStringLength u32> <errorString UTF-16BE, NUL-terminated>`; seen: code 6, `Read file data error`, tag all zero |
 
 `fileID` in `0xa3` is the requester's `fileID`. After the last piece of each
 file the Mac logs `setAttribute: 0` (`ChangeFileAttribute`); it sent no
-separate packet for it in the test. A missing file gets UploadMultiFileError
-(ID not confirmed). Other IDs from the decompile, not seen live:
+separate packet for it in the test. A missing file ends the whole request:
+the Mac logs `<path> does not exist!!!`, sends `0xa9`, and sends neither the
+remaining files nor `0xa7`. Other IDs from the decompile, not seen live:
 `0xa5` DownloadFileDataFailed, `0xa6` ResponseDownloadMultiFileZeroLength
 (`sessionID u32, count u16, fileIDs`), `0xab` DownloadMultiFileException.
 `0x0b` DownloadFile has a class but is not in `commandClassForCommandID:`, so
@@ -282,7 +284,8 @@ python3 -m unittest tools.test_upipe_peer
 
 Output: one `pkt_NNNN.bin` per fetched packet and `upipe_peer.jsonl`
 (`state`, `packet`, `command`, `queue`, `sent` records), plus
-`download_<fileID>.bin` per `--download`. `--endian big` sends the request
+`download_<fileID>.bin` per `--download`. With `--download` the tool stops as
+soon as `0xa7` or `0xa9` arrives. `--endian big` sends the request
 big-endian; it exists only to reproduce the crash below.
 
 Mac-side tracing uses `tools/gobridge_scsi.d` (dtrace on GoBridgeDemon's
@@ -302,6 +305,8 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `clip` (`--login linux-peer --clipboard …`, two runs) | Linux's text arrives in the Mac's pasteboard (checked with `pbpaste` over ssh). The encoder reproduces the Mac's own 587-byte text packet from `xfer` byte for byte. In a second run 40 s later the Mac sent no Login; after the tool was changed to log in first, the Mac answered with a ResponseResult and accepted the second push |
 | `dl` (`--download`, big-endian request) | The Mac's GoBridgeDemon threw an uncaught `NSRangeException` (`subdataWithRange: range {12, 23040} exceeds data length 102`): 23040 is `0x5A00`, our big-endian path length `0x005A` read little-endian. Wormhole.app relaunched the daemon (new PID), which sent Login again |
 | `dl…le` (`--download`, little-endian request) | Mac logs `remote is linux`, `sever will handle command: DownloadMultipleFile(0x10)`, `Send command: A3`, `setAttribute: 0`, `Send command: A7`. Linux receives ResponseResult (34 bytes, session 1), one 300 017-byte `0xa3` (file 1, index 1 of 1) and `0xa7`. The saved 300 000-byte file's SHA-256 matches the Mac's random test file |
+| `dl…big` (`--download`, 20 MiB random file) | Three `0xa3` pieces (8 MiB, 8 MiB, 4 MiB; `totalCount` 3, `currentIndex` 1–3), then `0xa7`. About 1.3 s from the request's ResponseResult to `0xa7` (~16 MB/s). SHA-256 matches |
+| `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
 `tools/filter_usbmon.py` (19 830 records, sha256 `11b0da0e…`), shows
@@ -316,8 +321,8 @@ because they contain the Mac's host name.
 
 - Drag-and-drop: what it needs from the peer (likely the mouse/KM side; the
   Mac abandoned the drag).
-- Files over 8 MiB (several `0xa3` pieces), missing files (UploadMultiFileError
-  ID) and the `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`).
+- The `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`) and when the
+  Mac uses it; other `0xa9` error codes.
 - The Mac as requester: serving `0x10` from Linux, and uploads (`0x11`…).
 - Image clipboard formats (only text and file seen).
 - `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.

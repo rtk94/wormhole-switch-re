@@ -220,6 +220,20 @@ class TestDownload(unittest.TestCase):
         d = u.describe_command(bytes([0xA7, 0, 0, 0, 1]))
         self.assertEqual((d["command_name"], d["session_id"]), ("DownloadMultiFileFinished", 1))
 
+    def test_upload_error_from_mac(self):
+        # 65-byte 0xA9 the Mac sent for a missing file (dl_2026-11-11_0928missing).
+        cmd = bytes.fromhex(
+            "a9" "00000001" "00000006" "00000001" "000000000000" "0000002a"
+            + "Read file data error\0".encode("utf-16-be").hex())
+        self.assertEqual(len(cmd), 65)
+        d = u.describe_command(cmd)
+        self.assertEqual((d["command_name"], d["session_id"], d["error_code"], d["file_id"],
+                          d["error"]), ("UploadMultiFileError", 1, 6, 1, "Read file data error"))
+
+    def test_upload_error_truncated(self):
+        cmd = bytes([0xA9]) + bytes(18) + struct.pack(">I", 10) + b"ab"
+        self.assertIn("decode_error", u.describe_command(cmd))
+
 
 class TestHeader(unittest.TestCase):
     def test_sg_io_hdr_size(self):

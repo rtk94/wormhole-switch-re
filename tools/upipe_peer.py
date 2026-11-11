@@ -74,7 +74,7 @@ CMD_DOWNLOAD_MULTI = 0x10
 CMD_XML = 0x39
 CMD_RESPONSE = 0xA1
 CMD_FILE_DATA = 0xA3
-CMD_DOWNLOAD_FINISHED = 0xA7
+CMD_DOWNLOAD_FINISHED = 0xA7; CMD_UPLOAD_ERROR = 0xA9
 COMMANDS = {
     0x00: "Dummy", 0x01: "Login", 0x02: "Logout", 0x04: "GetDirectoryInfo",
     0x06: "DeleteDirectory", 0x07: "MakeNewDirectory", 0x08: "DeleteFile",
@@ -82,7 +82,7 @@ COMMANDS = {
     0x37: "SyncDynamic", 0x39: "XmlPacket", 0xA1: "ResponseResult",
     0xA3: "DownloadFileData", 0xA5: "DownloadFileDataFailed",
     0xA6: "ResponseDownloadMultiFileZeroLength", 0xA7: "DownloadMultiFileFinished",
-    0xAB: "DownloadMultiFileException",
+    0xA9: "UploadMultiFileError", 0xAB: "DownloadMultiFileException",
 }
 FILE_DATA_HEADER = 17   # FileDataCommand headerLength: id + 4 x u32
 
@@ -358,6 +358,23 @@ def decode_file_data(cmd):
             "data": data}
 
 
+def decode_upload_error(cmd):
+    """UploadMultiFileError (0xA9), big-endian; the Mac sends it for a missing
+    file and ends the whole request (no further files, no 0xA7):
+    a9 <sessionID u32> <errorCode u32> <errorFileID u32> <tag 6 B>
+       <errorStringLength u32> <errorString UTF-16BE, NUL-terminated>
+    """
+    if len(cmd) < 23 or cmd[0] != CMD_UPLOAD_ERROR:
+        raise ValueError("not an UploadMultiFileError")
+    session_id, code, file_id = struct.unpack(">III", cmd[1:13])
+    (length,) = struct.unpack(">I", cmd[19:23])
+    raw = cmd[23:23 + length]
+    if len(raw) != length:
+        raise ValueError("UploadMultiFileError string truncated")
+    return {"session_id": session_id, "error_code": code, "file_id": file_id,
+            "tag": cmd[13:19].hex(), "error": raw.decode("utf-16-be").rstrip("\0")}
+
+
 def describe_command(cmd):
     if not cmd:
         return {"command": None}
@@ -375,6 +392,8 @@ def describe_command(cmd):
             out.update(d)
         elif cmd[0] == CMD_DOWNLOAD_FINISHED and len(cmd) >= 5:
             out["session_id"] = struct.unpack(">I", cmd[1:5])[0]
+        elif cmd[0] == CMD_UPLOAD_ERROR:
+            out.update(decode_upload_error(cmd))
     except ValueError as e:
         out["decode_error"] = str(e)
     return out
@@ -433,7 +452,8 @@ def main(argv):
                     help="with --login: push TEXT to the peer's clipboard once logged in")
     ap.add_argument("--download", metavar="PEER_PATH", action="append",
                     help="with --login: ask the peer to send this file (repeatable); "
-                         "saved as download_<n>.bin in --out")
+                         "saved as download_<n>.bin in --out; exits when the peer "
+                         "reports the request finished or failed")
     ap.add_argument("--endian", choices=["big", "little"], default="little",
                     help="byte order for --download fields (default little: the Mac decodes "
                          "a Linux peer little-endian; big crashed its daemon)")
@@ -456,6 +476,7 @@ def main(argv):
     after_login_sent = False
     endian = ">" if args.endian == "big" else "<"
     started = set()                     # file IDs whose download file we have opened
+    download_done = False               # 0xA7 or 0xA9 received: stop once txq drains
     end = time.time() + args.seconds
     last_state, n_rx, n_tx = None, 0, 0
     emit({"event": "start", "dev": args.dev, "fetch_cdb": fetch.hex(), "send_cdb": send.hex(),
@@ -527,6 +548,9 @@ def main(argv):
                         with open(path, "ab" if piece["file_id"] in started else "wb") as f:
                             f.write(piece["data"])
                         started.add(piece["file_id"])
+                    if args.download and cmd[:1] in (bytes([CMD_DOWNLOAD_FINISHED]),
+                                                     bytes([CMD_UPLOAD_ERROR])):
+                        download_done = True
                 if not ok:
                     break
 
@@ -538,6 +562,8 @@ def main(argv):
                 if not ok:
                     break
                 txq.pop(0)
+            if download_done and not txq:
+                break
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
