@@ -78,7 +78,7 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
 │   └── wormhole_bus3_live_2026-11-08_1755.pcap
 └── tools/
     ├── wormhole_parse.py         # stdlib-only usbmon pcap parser (CBW/CSW/SCSI + vendor 0xD9 HID + boot HID reports)
-    ├── test_wormhole_parse.py    # unittest suite for the parser (44 tests)
+    ├── test_wormhole_parse.py    # unittest suite for the parser (72 tests)
     ├── filter_usbmon.py          # keep one device's records from a raw usbmon pcap (sanitising)
     ├── test_filter_usbmon.py     # unittest suite for the filter (9 tests)
     ├── peer_rerun_send.py        # logged send driver for the peer->local re-run (sg_raw and SG_IO)
@@ -119,6 +119,7 @@ yet (#8); the UPipe format and a Linux peer are in
 python3 tools/wormhole_parse.py captures/wormhole_bus3_2026-11-06.pcap
 python3 tools/wormhole_parse.py captures/wormhole_bus3_2026-11-06.pcap --json
 python3 tools/wormhole_parse.py live.pcap --hid   # peer-active capture
+python3 tools/wormhole_parse.py live.pcap --orphans   # pair HID reports with accepted 0xD9 sends; orphans = no matching accepted send in the analysed packets
 python3 -m unittest tools.test_wormhole_parse
 python3 -m unittest tools.test_filter_usbmon
 python3 -m unittest tools.test_peer_rerun_send

@@ -462,5 +462,473 @@ class TestHidReports(unittest.TestCase):
         self.assertEqual(d["vendor_hid_type"], "mouse")
 
 
+class TestHidSendPairing(unittest.TestCase):
+    """Unit tests for pair_hid_reports_to_sends (issue #15).
+
+    A Wormhole HID report at one cable end is caused by an accepted
+    16-byte 0xD9 send submitted at the other end, so the pairing walk
+    matches sends to reports FIFO on (HID type, payload bytes) across
+    devices and flags unmatched reports as orphans.
+    """
+
+    def _hid(self, ep, payload, frame, ts, bus=3, dev=15):
+        return wp.UrbPacket(
+            frame=frame, ts=ts, urb_id=frame, kind="C", xfer=1,
+            endpoint=0x80 | ep, dev=dev, bus=bus, flag_setup=0,
+            flag_data=0, status=0, length=len(payload),
+            data_len=len(payload), setup=None, interval=0,
+            transfer_flags=0, payload=payload)
+
+    def _cbw(self, tag, cdb, frame, ts, bus=3, dev=15):
+        payload = (b"USBC" + struct.pack("<II", tag, 0)
+                   + bytes([0, 0, len(cdb)]) + cdb).ljust(31, b"\x00")
+        return wp.UrbPacket(
+            frame=frame, ts=ts, urb_id=frame, kind="S", xfer=3,
+            endpoint=0x02, dev=dev, bus=bus, flag_setup=0, flag_data=0,
+            status=-115, length=31, data_len=len(payload), setup=None,
+            interval=0, transfer_flags=0, payload=payload)
+
+    def _csw(self, tag, status, frame, ts, bus=3, dev=15):
+        payload = b"USBS" + struct.pack("<II", tag, 0) + bytes([status])
+        return wp.UrbPacket(
+            frame=frame, ts=ts, urb_id=frame, kind="C", xfer=3,
+            endpoint=0x81, dev=dev, bus=bus, flag_setup=0, flag_data=0,
+            status=0, length=13, data_len=len(payload), setup=None,
+            interval=0, transfer_flags=0, payload=payload)
+
+    def _send(self, hid_type, payload, frame, ts, tag=0x100, status=0,
+              bus=3, dev=15):
+        """One 0xD9 send as a CBW/CSW pair; status 0 = accepted."""
+        cdb = wp.build_vendor_hid_cdb(hid_type, payload)
+        return [self._cbw(tag, cdb, frame, ts, bus, dev),
+                self._csw(tag, status, frame + 2, ts + 0.001, bus, dev)]
+
+    def _mouse_report(self, x, frame, ts, bus=3, dev=15):
+        return self._hid(3, bytes([0, x & 0xFF, 0, 0]), frame, ts, bus, dev)
+
+    def test_accepted_send_pairs_with_report(self):
+        # The send is at the other cable end (bus 1); a host's own send
+        # on the same device never echoes back as a report.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(out["accepted_sends"], 1)
+        self.assertEqual(out["reports"], 1)
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertEqual(len(out["orphans"]), 0)
+        self.assertEqual(len(out["unpaired_sends"]), 0)
+        pair = out["pairs"][0]
+        self.assertEqual(pair["report"]["hex"], "003c0000")
+        self.assertEqual(pair["send_frame"], 10)
+        self.assertEqual(pair["send_payload_hex"],
+                         "003c00000000000000000000")
+        self.assertAlmostEqual(pair["gap_s"], 0.002, places=6)
+
+    def test_rejected_send_never_pairs(self):
+        # Re-run P4: a CHECK CONDITION (15-byte) send is rejected and
+        # forwards nothing, so the following report has no sender here.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0,
+                              status=1, bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(out["accepted_sends"], 0)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(out["orphans"][0]["hex"], "003c0000")
+
+    def test_orphan_report_without_any_send(self):
+        # The bus3_live2 shape (#15): one EP3 x=+60 report, no 0xD9
+        # anywhere in the capture -- an orphan, i.e. peer-side input.
+        packets = [self._mouse_report(0x3C, 849, 100.0)]
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(out["device_keys"], ["main 3:15"])
+        self.assertEqual(out["accepted_sends"], 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(out["orphans"][0]["frame"], 849)
+        self.assertEqual(out["orphans"][0]["x"], 60)
+
+    def test_value_mismatch_is_orphan(self):
+        packets = (self._send("3", bytes([0x00, 0x0A]), 10, 100.0,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 1)
+
+    def test_type_mismatch_is_orphan(self):
+        # A keyboard send cannot cause a mouse report (type byte '3' vs
+        # '4' and EP3 vs EP4 must agree).
+        packets = (self._send("4", bytes([0x00, 0x00, 0x04]), 10, 100.0,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x00, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(out["orphans"][0]["kind"], "mouse")
+
+    def test_report_before_send_stays_orphan(self):
+        # The reviewer's repro: a matching send AFTER the report cannot
+        # have caused it -- pairing stays off regardless of FIFO order.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.100,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.0)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 1)
+
+    def test_stale_send_outside_window_stays_orphan(self):
+        # A matching send far older than the window (here 1 s; observed
+        # merged pairs span -0.56 to +2.02 ms) is not a plausible cause:
+        # orphan.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 99.0,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.0)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 1)
+
+    def test_send_within_window_pairs_and_gap_is_positive(self):
+        # 40 ms is inside the 50 ms forward window: it pairs.  Gaps are
+        # signed (the negative-gap case below pairs at -8 ms); this one
+        # happens to be positive.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 99.960,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.0)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertAlmostEqual(out["pairs"][0]["gap_s"], 0.040, places=6)
+
+    def test_peer_offset_corrects_report_clock(self):
+        # The report host's clock runs ahead: the report is stamped
+        # 60 ms after its send, outside the 50 ms window.  A known
+        # +60 ms correction (subtracted from report timestamps) pairs
+        # it, and the reported gap is the corrected one.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.060)])
+        self.assertEqual(len(wp.pair_hid_reports_to_sends(packets)["pairs"]), 0)
+        out = wp.pair_hid_reports_to_sends(packets, peer_offset=0.060)
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertAlmostEqual(out["pairs"][0]["gap_s"], 0.0, places=6)
+        self.assertEqual(out["peer_offset_source"], "flag")
+        self.assertAlmostEqual(out["peer_offset_s"], 0.060, places=9)
+
+    def test_offset_estimate_recovers_synthetic_skew(self):
+        # All sends on one host, all reports on the other; the report
+        # host's clock runs ~70 ms ahead, so every raw gap leaves the
+        # window.  Zero-offset pairing finds nothing; auto-estimation
+        # finds a correcting offset in the grid and pairs 10/10.  (The
+        # estimator returns the least correction consistent with the
+        # data -- the pairing window is 60 ms wide, so the recovered
+        # value need not equal the planted skew exactly.)
+        sends = []
+        reports = []
+        for i in range(10):
+            x = 0x10 + i
+            sends += self._send("3", bytes([0x00, x]), 10 + i * 10,
+                                100.0 + i * 0.05, bus=1, dev=6)
+            reports.append(self._mouse_report(
+                x, 20 + i * 10, 100.0 + i * 0.05 + 0.0013 + 0.070,
+                bus=3, dev=15))
+        merged = sorted(sends + reports, key=lambda p: p.ts)
+        zero = wp.pair_hid_reports_to_sends(merged)
+        self.assertEqual(len(zero["pairs"]), 0)
+        est = wp.pair_hid_reports_to_sends(merged, estimate_offset=True)
+        self.assertEqual(est["peer_offset_source"], "estimated")
+        self.assertGreaterEqual(est["peer_offset_s"], -0.100)
+        self.assertLessEqual(est["peer_offset_s"], 0.100)
+        self.assertEqual(len(est["pairs"]), 10)
+
+    def test_in_window_negative_gap_pairs(self):
+        # An 8 ms early report is within the clock-skew allowance: it
+        # pairs, and the gap is reported negative.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.008,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.0)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertAlmostEqual(out["pairs"][0]["gap_s"], -0.008, places=6)
+
+    def test_gap_just_outside_forward_bound_stays_orphan(self):
+        # +60 ms is just outside the 50 ms forward bound: orphan, so
+        # widening PAIR_WINDOW_S to 0.9 no longer passes the suite.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 99.940,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.0)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 1)
+
+    def test_gap_just_outside_backward_bound_stays_orphan(self):
+        # -20 ms is just outside the 10 ms skew bound: orphan, so
+        # widening PAIR_SKEW_S to 0.09 no longer passes the suite.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.020,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.0)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 1)
+
+    def test_same_device_send_never_pairs(self):
+        # The reviewer's repro: a local accepted send followed 2 ms
+        # later by a matching report on the same device is not a pair --
+        # a host's own send never echoes back, so the report stays an
+        # orphan (genuine peer-side input keeps its orphan status).
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 1)
+
+    def test_send_is_consumed_one_to_one(self):
+        # Two identical reports but one send: the second report stays
+        # unmatched instead of reusing the consumed send.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0,
+                              bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002),
+                      self._mouse_report(0x3C, 30, 100.004)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 0)
+
+    def test_fifo_consumes_earliest_send(self):
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0,
+                              tag=0x101, bus=1, dev=6)
+                   + self._send("3", bytes([0x00, 0x3C]), 14, 100.1,
+                                tag=0x102, bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets)
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertEqual(out["pairs"][0]["send_frame"], 10)
+        self.assertEqual(out["unpaired_sends"][0]["frame"], 14)
+
+    def test_cross_device_pairing_for_merged_ends(self):
+        # The two cable ends enumerate as different bus:dev numbers;
+        # on merged both-ends packets a report pairs across devices.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0, bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(
+            packets,
+            device_keys={("main", 1, 6), ("main", 3, 15)})
+        self.assertEqual(out["device_keys"],
+                         ["main 1:6", "main 3:15"])
+        self.assertEqual(len(out["pairs"]), 1)
+        self.assertEqual(out["pairs"][0]["send_bus"], 1)
+        self.assertEqual(out["pairs"][0]["report"]["bus"], 3)
+
+    def test_fallback_scoping_without_enumeration(self):
+        # No control enumeration in the packets: scoping falls back to
+        # the devices the accepted 0xD9 sends and EP3/EP4 reports point
+        # at, so the pairing still works.
+        packets = (self._send("3", bytes([0x00, 0x3C]), 10, 100.0, bus=1, dev=6)
+                   + [self._mouse_report(0x3C, 20, 100.002)])
+        out = wp.pair_hid_reports_to_sends(packets, device_keys=None)
+        self.assertEqual(out["device_keys"],
+                         ["main 1:6", "main 3:15"])
+        self.assertEqual(len(out["pairs"]), 1)
+
+
+class TestHidSendPairingCaptures(unittest.TestCase):
+    """Issue #15 against the committed peer-active captures.
+
+    live3 (local end) and bus1_live (peer end) are the two halves of the
+    same session; the re-run is the local half of a later peer-side
+    sequence whose sends tools/peer_rerun_send.py logged on the peer.
+    """
+
+    LIVE3 = REPO / "captures" / "wormhole_bus3_live3_2026-11-06.pcap"
+    BUS1 = REPO / "captures" / "wormhole_bus1_live_2026-11-06.pcap"
+    RERUN = REPO / "captures" / "wormhole_bus3_rerun_2026-11-06.pcap"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.live3 = wp.read_pcap(cls.LIVE3)
+        cls.bus1 = wp.read_pcap(cls.BUS1, capture_id="peer")
+        cls.rerun = wp.read_pcap(cls.RERUN)
+        cls.live3_pairing = wp.pair_hid_reports_to_sends(cls.live3.packets)
+        cls.bus1_pairing = wp.pair_hid_reports_to_sends(cls.bus1.packets)
+        merged = sorted(cls.live3.packets + cls.bus1.packets,
+                        key=lambda p: p.ts)
+        cls.merged_pairing = wp.pair_hid_reports_to_sends(merged)
+        cls.rerun_pairing = wp.pair_hid_reports_to_sends(cls.rerun.packets)
+
+    def test_live3_x60_report_is_an_orphan_locally(self):
+        # 9 local accepted sends (x=+10/+20/+30, click, keyboard) plus
+        # one EP3 x=+60 report whose sender is not in this capture.
+        out = self.live3_pairing
+        self.assertEqual(out["device_keys"], ["main 3:15"])
+        self.assertEqual(out["accepted_sends"], 9)
+        self.assertEqual(out["reports"], 1)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 1)
+        self.assertEqual(len(out["unpaired_sends"]), 9)
+        orphan = out["orphans"][0]
+        self.assertEqual(orphan["frame"], 131)
+        self.assertEqual(orphan["hex"], "003c0000")
+        self.assertEqual(orphan["x"], 60)
+
+    def test_bus1_only_accepted_send_is_mouse60(self):
+        # The peer end sent 8 CDBs, 7 arrived 15-byte and were rejected;
+        # the one accepted send is mouse x=+60 (16-byte framing).
+        out = self.bus1_pairing
+        self.assertEqual(out["device_keys"], ["peer 1:6"])
+        self.assertEqual(out["accepted_sends"], 1)
+        self.assertEqual(out["reports"], 9)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 9)
+        unpaired = out["unpaired_sends"][0]
+        self.assertEqual(unpaired["frame"], 131)
+        self.assertEqual(unpaired["hid_type"], "mouse")
+        self.assertEqual(unpaired["payload_hex"],
+                         "003c00000000000000000000")
+
+    def test_merged_ends_pair_one_to_one(self):
+        # Merging both cable ends: 10/10 reports pair with accepted
+        # sends across devices, in order, gaps within a few ms of clock
+        # skew.  The x=+60 report's sender is the peer's frame-131 send.
+        out = self.merged_pairing
+        self.assertEqual(out["device_keys"], ["main 3:15", "peer 1:6"])
+        self.assertEqual(out["accepted_sends"], 10)
+        self.assertEqual(out["reports"], 10)
+        self.assertEqual(len(out["pairs"]), 10)
+        self.assertEqual(len(out["orphans"]), 0)
+        self.assertEqual(len(out["unpaired_sends"]), 0)
+        x60 = [p for p in out["pairs"] if p["report"]["hex"] == "003c0000"]
+        self.assertEqual(len(x60), 1)
+        self.assertEqual((x60[0]["send_bus"], x60[0]["send_dev"]), (1, 6))
+        self.assertEqual(x60[0]["send_frame"], 131)
+        self.assertLess(abs(x60[0]["gap_s"]), 0.005)
+        for p in out["pairs"]:
+            self.assertLess(abs(p["gap_s"]), 0.005)
+
+    def test_rerun_orphans_match_the_peer_send_log(self):
+        # Single-sided local capture: all 12 reports are orphans here;
+        # their senders are the 12 accepted P1-P3 sends the peer logged
+        # via tools/peer_rerun_send.py (M+1, M-1, MZ, KZ per phase).
+        out = self.rerun_pairing
+        self.assertEqual(out["device_keys"], ["main 3:15"])
+        self.assertEqual(out["accepted_sends"], 0)
+        self.assertEqual(out["reports"], 12)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 12)
+        want = [("mouse", "00010000"), ("mouse", "00ff0000"),
+                ("mouse", "00000000"), ("keyboard", "0000000000000000")] * 3
+        got = [(r["kind"], r["hex"]) for r in out["orphans"]]
+        self.assertEqual(got, want)
+
+    def test_idle_capture_wormhole_has_no_orphans(self):
+        # VID:PID scoping keeps the Logitech receiver's 841 EP2 reports
+        # out: the Wormhole had no reports and no 0xD9 sends at all.
+        pcap = wp.read_pcap(PCAP)
+        out = wp.pair_hid_reports_to_sends(pcap.packets)
+        self.assertEqual(out["device_keys"], ["main 3:15"])
+        self.assertEqual(out["accepted_sends"], 0)
+        self.assertEqual(out["reports"], 0)
+        self.assertEqual(len(out["pairs"]), 0)
+        self.assertEqual(len(out["orphans"]), 0)
+
+    def test_same_bus_dev_across_captures_still_pairs(self):
+        # rtk94's remap repro: the peer capture enumerates the SAME
+        # bus:dev numbers as live3.  Device identity is per capture
+        # ((capture_id, bus, dev)), so this still pairs 10/10; a
+        # bus:dev-only identity silently dropped it to 0.
+        from dataclasses import replace
+        remapped = [replace(p, bus=3, dev=15) for p in self.bus1.packets]
+        merged = sorted(self.live3.packets + remapped, key=lambda p: p.ts)
+        out = wp.pair_hid_reports_to_sends(merged)
+        self.assertEqual(len(out["pairs"]), 10)
+        self.assertEqual(len(out["orphans"]), 0)
+
+    def test_one_capture_without_enumeration_still_pairs(self):
+        # rtk94's 2026-11-11 review, fallback table: if one end's capture
+        # has no control transfers, the old all-or-nothing fallback
+        # dropped that end's device and every report became an orphan.
+        # The fallback is per capture now: stripping bus1_live's
+        # enumeration still pairs 10/10.
+        stripped = [p for p in self.bus1.packets if p.xfer != 2]
+        merged = sorted(self.live3.packets + stripped, key=lambda p: p.ts)
+        out = wp.pair_hid_reports_to_sends(merged)
+        self.assertEqual(out["device_keys"],
+                         ["main 3:15", "peer 1:6"])
+        self.assertEqual(len(out["pairs"]), 10)
+        self.assertEqual(len(out["orphans"]), 0)
+
+    def test_main_host_device_at_peer_bus_dev_is_excluded(self):
+        # rtk94's 2026-11-11 review, cross-capture ambiguity: another
+        # HID device sitting at the peer cable's bus:dev on the MAIN
+        # host must stay out of the pairing.  Its reports decode fine,
+        # so only the per-capture key scoping keeps it out.
+        impostor = wp.UrbPacket(
+            frame=500, ts=100.5, urb_id=500, kind="C", xfer=1,
+            endpoint=0x83, dev=6, bus=1, flag_setup=0, flag_data=0,
+            status=0, length=4, data_len=4, setup=None, interval=0,
+            transfer_flags=0, payload=bytes([0, 0x7F, 0, 0]))
+        merged = sorted(
+            self.live3.packets + self.bus1.packets + [impostor],
+            key=lambda p: p.ts)
+        out = wp.pair_hid_reports_to_sends(merged)
+        self.assertEqual(out["reports"], 10)  # impostor not analysed
+        self.assertEqual(len(out["pairs"]), 10)
+        self.assertEqual(len(out["orphans"]), 0)
+        self.assertEqual(out["device_keys"],
+                         ["main 3:15", "peer 1:6"])
+
+    def test_report_clock_shift_table(self):
+        # rtk94's shift table, reproduced on the committed captures:
+        # shifting bus1_live (the report end) by Delta and pairing at
+        # offset 0 is exactly "pairing failing in a way that looks like
+        # skew".  Measured: 10 / 9 / 1 / 0 pairs at 0 / +12 / -20 /
+        # +100 ms.
+        from dataclasses import replace
+        measured = {0.0: 10, 0.012: 9, -0.020: 1, 0.100: 0}
+        for delta, expected in sorted(measured.items()):
+            shifted = [replace(p, ts=p.ts + delta) for p in self.bus1.packets]
+            merged = sorted(self.live3.packets + shifted,
+                            key=lambda p: p.ts)
+            out = wp.pair_hid_reports_to_sends(merged)
+            self.assertEqual(len(out["pairs"]), expected,
+                             "shift %r ms" % (delta * 1000.0))
+            # and the failure is recoverable: correcting the peer
+            # capture's clock re-pairs 10/10 for every shift in the table
+            est = wp.pair_hid_reports_to_sends(
+                merged, estimate_offset=True, peer_capture_id="peer")
+            self.assertEqual(len(est["pairs"]), 10,
+                             "recovery at shift %r ms" % (delta * 1000.0))
+
+    def test_cli_peer_flag_pairs_two_captures(self):
+        # --peer replaces the external mergecap step: the two halves of
+        # the 2026-11-08 session pair directly from the CLI.
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = wp.main([str(self.LIVE3), "--orphans", "--peer",
+                          str(self.BUS1), "--json"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(len(out["hid_send_pairing"]["pairs"]), 10)
+
+    def test_orphan_wording_is_neutral(self):
+        # rtk94: a single-sided orphan must not claim the sender is at
+        # the other cable end -- state the absence, not an origin.
+        blob = "\n".join(wp._fmt_pairing(self.live3_pairing))
+        self.assertIn(
+            "no matching accepted 0xD9 send in the analysed packets", blob)
+        self.assertNotIn("other cable end", blob)
+
+    def test_pairing_output_is_json_serialisable(self):
+        blob = json.dumps(self.merged_pairing, sort_keys=True)
+        self.assertIn("003c0000", blob)
+        self.assertIn("send_payload_hex", blob)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
