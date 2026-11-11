@@ -45,6 +45,7 @@ This is a **documentation and reverse-engineering research** repository. There i
 - `tools/peer_rerun_send.py` — logged send driver for peer→local re-run tests (uses `sg_raw` + direct `SG_IO`).
 - `tools/upipe_peer.py` — Linux GoBridge peer over UPipe (SG_IO); its decoders are shared with the parser.
 - `tools/gobridge_scsi.d` — dtrace tracer for GoBridgeDemon's SCSI tasks on macOS.
+- `tools/windows_capture.ps1` — guided Windows-guest session for the Windows peer capture, with UTC step markers.
 - All Python tools have unittest suites. New code needs tests.
 
 ## License
