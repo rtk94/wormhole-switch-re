@@ -121,9 +121,29 @@ IDs known to `CommandDataBuffer commandClassForCommandID:`: `0x00` (dummy),
 operations listed in [mac-gobridge.md](mac-gobridge.md#file-transfer-command-surface-objc-selectors).
 Client side (`THMGBClient`) handles `0xa1`–`0xa9` and `0xad`, starting with
 `0xa1` ResponseResult. `0x39` is `XmlPacketCommand`; `OTiCommand doCommand:`
-drops it while the server is not connected. Login, ResponseResult and the
-clipboard form of XmlPacket and the file download are decoded below; other
-payloads are not.
+drops it while the server is not connected. Login, ResponseResult, the
+clipboard and drive-list forms of XmlPacket, the file download, the remote
+browser, MakeNewDirectory and the upload are decoded below; other payloads
+are not.
+
+Command IDs recovered so far (not exhaustive), from each class's `init`
+(`setCommandID:`) in the decompiled GoBridgeDemon:
+
+| ID | Command | ID | Command |
+|---|---|---|---|
+| `0x01` | Login | `0x39` | XmlPacket |
+| `0x02` | Logout | `0xa1` | ResponseResult |
+| `0x04` | GetDirectoryInfo | `0xa2` | DirectoryInfo |
+| `0x07` | MakeNewDirectory | `0xa3` | DownloadFileData |
+| `0x0a` | UploadFile | `0xa4` | DriveInfo |
+| `0x0c` | UploadFileData | `0xa7` | DownloadMultiFileFinished |
+| `0x0d` | UploadFileAbort | `0xa8` | UploadMultiFileConfirmation |
+| `0x10` | DownloadMultipleFile | `0xa9` | UploadMultiFileError |
+| `0x11` | DownloadMultipleFileAbort | `0xaa` | UploadMultiFileConfirmationExt |
+| `0x12` | UploadMultipleFile | `0xad` | DomainFolders |
+| `0x13` | UploadMultipleFileConfirm | `0x34` | SyncDynamic |
+| `0x14` | UploadMultipleFileAbort | `0x37` | ChangeFileAttribute |
+| `0x15` | UploadMultipleFileZeroLength | | |
 
 ### OS byte
 
@@ -283,10 +303,118 @@ Serving from Linux (`--offer`), little-endian replies in the order above
 were accepted: the Mac logs `Client commandID: A1`, `ResponseResult(0xa1)
 {_RequestCommand:16, _RequestResult:0, …}`, `A3`, `A7`, `multi download
 finish: <session>` and `[Download]Did download N files`. After an `0xa9` it
-keeps the files that arrived, logs `Did download 1 files` and drops the
-session; no dialog appears. A request left unanswered gets no timeout,
-error or dialog in the 4 minutes watched; the next paste starts a new
-session.
+keeps the files that arrived, logs `Did download 1 files`, drops the
+session, and Wormhole.app shows a `Warning` dialog: `Fail to copy file
+"<path>"!` with the path from the `0xa9`'s file. A request left unanswered
+gets no timeout, error or dialog in the 4 minutes watched; the next paste
+starts a new session.
+
+### Drive list (`0x39`): remote browser roots
+
+A Linux peer announces its folders with an XmlPacket (from the decompiled
+`NP_Cmd_Post_Drive_Update_Info` handling; one line on the wire):
+
+```xml
+<ExtraXmlCommand>HookAppService</ExtraXmlCommand><ExtraXmlParam><OTIMSG>
+  <NP_Cmd>NP_Cmd_Post_Drive_Update_Info</NP_Cmd>
+  <NP_Remote_Request_Info><NP_Misc_Drive_ListMRS>
+    <Line><NP_Misc_Drive_Letter>/home/user/share</NP_Misc_Drive_Letter>
+          <NP_Misc_Drive_Total_Space_Number>N</NP_Misc_Drive_Total_Space_Number>
+          <NP_Misc_Drive_Free_Space_Number>N</NP_Misc_Drive_Free_Space_Number></Line>
+  </NP_Misc_Drive_ListMRS></NP_Remote_Request_Info>
+</OTIMSG></ExtraXmlParam>
+```
+
+`upipe_peer.py --share` sends it once the Mac accepts our Login. Wormhole.app's
+window then reads `Remote Computer: Android Android`, shows the drive path in
+its path bar and requests its listing with `0x04`. The sidebar's DEVICES list
+stays empty.
+
+### GetDirectoryInfo (`0x04`) and DirectoryInfo (`0xa2`)
+
+```
+04 <pathLen u16> <path UTF-16, no NUL>
+```
+
+The server answers with ResponseResult (`requestCommand` 4, result 0), then:
+
+```
+a2 <count u16> <count × 552-byte record> <freeSpace u64> <pad byte>
+```
+
+Record (`0x228` bytes, ten u32 words, then the name):
+
+| Offset | Field |
+|---|---|
+| 0 | attributes: `0x10` directory, `0x02` hidden, `0x01` read-only, `0x04` root-owned, `0x10000` symlink |
+| 4, 8 | creation time, low word then high word, Unix seconds |
+| 12, 16 | last access time, same form |
+| 20, 24 | last write time, same form (the Date Modified column) |
+| 28, 32 | size, low word then high word (a 5 GiB file showed as `5 GB`) |
+| 36 | name length in bytes (at most 512) |
+| 40 | name, UTF-16, no NUL |
+
+The time and size words were settled live: a probe listing one entry per
+candidate encoding showed the right date only for (low, high) Unix seconds.
+The decoder reads `freeSpace` only when at least one more byte follows it
+(`offset < length − 9`), so the pad byte is needed. Without it the window
+shows `0 bytes available`; with it, the share's real free space. Expanding a
+folder's disclosure triangle, and the Mac's refresh after every paste, send a
+new `0x04` for that path. On error the server sends ResponseResult result 1,
+error code 3, and no `0xa2`.
+
+### MakeNewDirectory (`0x07`)
+
+```
+07 <sessionID u32> <pathLen u16> <path UTF-16 + NUL>
+```
+
+Before every paste the Mac sends one for the destination folder itself, with
+the upload's session ID. The server creates it if needed and answers
+ResponseResult (`requestCommand` 7, session 0, result 0).
+
+### Upload: Mac → shared folder
+
+A Finder copy pasted into Wormhole.app's remote browser (Edit > Paste) runs:
+
+1. `0x07` for the destination folder (above).
+2. `0x13` UploadMultipleFileConfirm, Mac → server:
+   ```
+   13 <multiSessionID u32> <allFileSize u64> <largeFilesCount u16> <count u16>
+      { <fileID u32> <pathLen u16> <path UTF-16 + NUL> }*
+   ```
+   Paths are destination paths on the server.
+3. `0xa8` UploadMultiFileConfirmation, server → Mac:
+   ```
+   a8 <readOnly u8> <freeSpace u8> <fileSystem u8> <destRootReadOnly u8>
+      <sessionID u32> <existCount u32> <existFileID u32>*
+   ```
+   The Mac stops when `freeSpace` is 0 or `destRootReadOnly` is 1. For each
+   ID in the exist list it shows its own `An item named "…" already exists
+   in this location` dialog (Don't Replace / Stop / Replace, Apply to all).
+   Don't Replace sent nothing more for that file (one file: no `0x12` at
+   all, only a refresh). Replace went on as below and overwrote the file.
+4. `0x12` UploadMultipleFile, Mac → server, with no size fields:
+   ```
+   12 <multiSessionID u32> <count u16> { <fileID u32> <pathLen u16> <path UTF-16 + NUL> }*
+   ```
+   The server answers only on error (ResponseResult result 1).
+5. `0x0c` UploadFileData, Mac → server, one per piece, in the same form as
+   `0xa3`: `0c <fileID u32> <totalCount u32> <currentIndex u32> <dataLength u32> <data>`,
+   at most 8 MiB per piece. Files go one after another.
+6. When every file of the session is written, the server sends `0xa7`
+   DownloadMultiFileFinished with the session ID. An error goes out as `0xa9`
+   (code 3, `Remote operation error`). `0x14` UploadMultipleFileAbort carries
+   the session ID.
+
+`0x0a` UploadFile, `0x0d` and `0x15` exist but were not seen.
+
+### Copy: shared folder → Mac
+
+Selecting a file in the remote browser, Edit > Copy, then Paste in Finder
+sends the same `0x10` request as a clipboard paste, for the shared path
+(session 106, file ID 107: here the file ID did not equal the session ID).
+The replies are those of [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents).
 
 ## Linux peer: `tools/upipe_peer.py`
 
@@ -305,6 +433,8 @@ python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --second
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 30 --login linux-peer --download "/Users/<user>/file.bin"
 # Put local files on the Mac's clipboard and serve them when pasted in Finder
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 90 --login linux-peer --offer ./a.bin --offer ./b.bin
+# Share a folder: browse it, copy from it and paste into it from Wormhole.app
+python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 600 --login linux-peer --share ~/share
 python3 -m unittest tools.test_upipe_peer
 ```
 
@@ -315,6 +445,11 @@ soon as `0xa7` or `0xa9` arrives. `--endian big` sends the request
 big-endian; it exists only to reproduce the crash below. `--offer` serves
 only the offered files (anything else gets `0xa9`, code 6), re-reading each
 file when the request arrives, and exits once a request is answered.
+`--share` (repeatable) runs for `--seconds`. It lists, serves, creates
+folders and accepts uploads only inside the shared folders, after resolving
+symlinks. A request it cannot parse gets ResponseResult result 1 instead of
+stopping the tool. When the Mac logs out (Wormhole.app restarted), the tool
+logs in again and resends the drive list.
 
 Mac-side tracing uses `tools/gobridge_scsi.d` (dtrace on GoBridgeDemon's
 `SCSITaskClass` calls; usage in the script header). It needs root, so it
@@ -337,7 +472,12 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `offer` (`--offer`, no serving yet) | Finder paste on the Mac (AppleScript `keystroke "v"` over ssh) leads to a 171-byte big-endian `0x10` (session 101, file ID 101, the offered path plus a NUL, no destination). The Mac then logs `The dummy file has not yet been copied, wait a moment...` 7 times at 0.5 s intervals (`nTimeout` 0–6, the same on every later paste, served or not) and nothing more for session 101 |
 | `serve` (`--offer`, Mac-style `/\…` path) | ResponseResult, one 300 017-byte `0xa3`, `0xa7`, all little-endian; the Mac logs `multi download finish: 102`. The pasted file's SHA-256 matches, but its name is the whole `\home\…\wh_serve_test.bin` path |
 | `serve…big` (`--offer`, POSIX path, 20 MiB random file) | Named `wh_big.bin`. Three `0xa3` (8, 8, 4 MiB), `0xa7`; 338 sends, none failed, about 1.1 s from the request to the last send (~18 MB/s). SHA-256 matches |
-| `serve…err` (`--offer` two files, the second deleted before the paste) | One 315-byte `0x10` for both (session 104, file IDs 104/105). ResponseResult, `0xa3` for the first, `0xa9` (code 6) for the second. The Mac keeps the first file (SHA-256 matches), logs `Did download 1 files`, removes the session; no dialog |
+| `serve…err` (`--offer` two files, the second deleted before the paste) | One 315-byte `0x10` for both (session 104, file IDs 104/105). ResponseResult, `0xa3` for the first, `0xa9` (code 6) for the second. The Mac keeps the first file (SHA-256 matches), logs `Did download 1 files`, removes the session; Wormhole.app shows `Fail to copy file "…/wh_gone.bin"!` |
+| `share` (`--share`, then browsing on the Mac) | The drive list shows the share in Wormhole.app; the Mac requests its listing (`0x04`, 71 bytes). Names, sizes (a 5 GiB sparse file as `5 GB`), dates and folders show; expanding `subdir` requests it. Free space showed `0 bytes available` until the pad byte was added, then `73.47 GB available` (`df`: 78 886 010 880 bytes) |
+| `upload` (Finder copy, Paste in the remote browser) | `0x07`, `0x13` (100 000 bytes) → `0xa8`, a 101-byte `0x12`, one `0x0c`, then our `0xa7` and the Mac's refresh. SHA-256 matches. The first try crashed the tool: it parsed `0x12` with `0x13`'s layout. The Mac's window then stayed busy until Wormhole.app was restarted |
+| `upload…big`, `upload…two` | 20 MiB: three `0x0c` (8, 8, 4 MiB), about 1.3 s from `0x12` to the last piece (~16.5 MB/s). Two files in one paste: one `0x13`/`0x12` pair listing both, the pieces file by file, one `0xa7`. All hashes match |
+| `upload…exists` (same file pasted again) | `0xa8` lists the file's ID; the Mac shows its replace dialog. Don't Replace: no `0x12`, file unchanged. Replace: `0x12`, `0x0c`, file overwritten (hash matches) |
+| `sharedl` (Copy in the remote browser, Paste in Finder) | The Mac sends `0x10` for the shared path; ResponseResult, `0xa3`, `0xa7`; the Mac logs `Did download 1 files`. SHA-256 matches |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
@@ -357,8 +497,10 @@ because they contain the Mac's host name.
   Mac abandoned the drag).
 - The `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`) and when the
   Mac uses it; other `0xa9` error codes.
-- Uploads and file operations (`0x11`…, `handleUploadFileData`, rename,
-  delete, mkdir): what triggers them from the Mac.
+- Rename, delete and New Folder from the remote browser: which commands
+  they use (`0x37` ChangeFileAttribute is one candidate).
+- `0x0a` UploadFile, `0x0d`, `0x15` (zero-length upload) and `0xaa`: when
+  the Mac uses them.
 - `0xa6` (zero-length file) and `0xa5`/`0xab`: `--offer` sends an empty file
   as one empty `0xa3`, which is not verified live.
 - Image clipboard formats (only text and file seen).
