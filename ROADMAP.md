@@ -41,7 +41,7 @@ Milestones track the reverse-engineering progression from initial enumeration to
 
 ---
 
-## 🔄 v0.4 — UPipe protocol (file / clipboard channel) — **CURRENT**
+## ✅ v0.4 — UPipe protocol (file / clipboard channel) (Done)
 
 The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and verified end-to-end. Multimedia `'6'` mapped (all-zero probe; inferred `payload[0]` = usage). The **file/clipboard channel** uses the same SCSI Bulk-Only pipe: a `0xD8` status poll plus `0xD9 0x28` / `0xD9 0x2A` 64 KiB transfers (`docs/upipe-protocol.md`).
 
@@ -52,11 +52,11 @@ The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and veri
 - [x] `tools/wormhole_parse.py` decodes UPipe: poll state, chunk headers and the reassembled commands, reusing the `tools/upipe_peer.py` decoders (#8)
 - [x] Document in `docs/transport.md` (new section) + new `docs/upipe-protocol.md`
 
-**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`), file download from the Mac (`--download`), serving files the Mac pastes (`--offer`), and sharing folders (`--share`) that Wormhole.app browses, copies from, uploads into (SHA-256 checked up to 20 MiB, two files per paste, replace prompt), renames in, creates folders in and moves to the Trash from; images on the clipboard both ways (`--clipboard-image`, `--save-clipboard-images`); small files served in MultipleFilePackages. `tools/wormhole_parse.py` decodes UPipe in usbmon captures. Every v0.4 checklist item is ticked.
+**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`), file download from the Mac (`--download`), serving files the Mac pastes (`--offer`), and sharing folders (`--share`) that Wormhole.app browses, copies from, uploads into (SHA-256 checked up to 20 MiB, two files per paste, replace prompt), renames in, creates folders in and moves to the Trash from; images on the clipboard both ways (`--clipboard-image`, `--save-clipboard-images`); small files served in MultipleFilePackages. `tools/wormhole_parse.py` decodes UPipe in usbmon captures. Every command ID is mapped to its GoBridge handler, with its live status, in `docs/upipe-protocol.md` § Selector map. Closed 2026-11-11 with #9.
 
 ---
 
-## 🔄 v0.5 — Windows host software parity (In progress)
+## 🔄 v0.5 — Windows host software parity (In progress) — **CURRENT**
 
 macOS GoBridgeDemon is analysed to function level (`docs/mac-gobridge.md`). Windows path (`SKLoader.exe` → embedded DLL → `OTiTransfer`) is mapped at import/resource level (`docs/pe-analysis.md`). GSDD container format is reversed (`docs/gsdd.md`).
 
@@ -106,17 +106,16 @@ Host-side observations resolved several firmware-adjacent questions without need
 | v0.1 | Enumeration & topology | ✅ Done | — |
 | v0.2 | SCSI / Mass Storage | ✅ Done | — |
 | v0.3 | ISO payload & host inventory | ✅ Done | — |
-| v0.4 | **UPipe protocol** | 🔄 **In progress** | Checklist complete; ready to close |
-| v0.5 | Windows host parity | 🔄 In progress | After v0.4 |
+| v0.4 | UPipe protocol | ✅ Done | — |
+| v0.5 | **Windows host parity** | 🔄 **In progress** | Windows peer capture |
 | v0.6 | Firmware internals | 🔄 Partially resolved | Long-term |
 | v1.0 | Stable reference release | 📋 Planned | When v0.4–0.6 converge |
 
 ---
 
-## How to move v0.4 forward
+## What comes after v0.4
 
-The capture method is in `docs/upipe-protocol.md` (Linux peer tool + Mac dtrace tracer). Remaining steps:
+v0.4 is done (#9). The capture method is in `docs/upipe-protocol.md` (Linux peer tool + Mac dtrace tracer). Next:
 
 1. Repeat against a Windows peer for parity (v0.5), including the Windows-only clipboard formats (DIB, RTF, HTML, multiple images).
-
-Uploads, file operations, images and MultipleFilePackage are done (#9); every v0.4 checklist item is ticked.
+2. Still unobserved from the Mac, listed in `docs/upipe-protocol.md` § Open questions: the aborts (`0x11`, `0x14`), `0x37` ChangeFileAttribute, drag-and-drop.
