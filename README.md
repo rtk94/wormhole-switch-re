@@ -92,7 +92,8 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
     ├── test_peer_rerun_send.py   # unittest suite for the driver
     ├── upipe_peer.py             # Linux UPipe peer: login, clipboard, file download/serving, shared folders (SG_IO)
     ├── test_upipe_peer.py        # unittest suite for the peer
-    └── gobridge_scsi.d           # dtrace tracer for GoBridgeDemon's SCSI tasks (macOS)
+    ├── gobridge_scsi.d           # dtrace tracer for GoBridgeDemon's SCSI tasks (macOS)
+    └── windows_capture.ps1       # guided Windows-guest session with step markers for the Windows peer capture (#50)
 ```
 
 ## Reproduce the basics

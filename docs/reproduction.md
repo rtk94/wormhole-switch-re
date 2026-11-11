@@ -285,7 +285,15 @@ While the VM runs, libvirt unbinds the host drivers from the Wormhole
    sequence as §6.3, then the Windows-only clipboard formats: an image
    copied from Paint (DIB), formatted text from WordPad (RTF), a selection
    from a browser (HTML), and several images at once.  Repeat in both
-   directions.
+   directions.  `tools/windows_capture.ps1` walks through all of this in
+   the guest: it creates synthetic test files, sets each clipboard format
+   itself, prompts for the Mac-side and Wormhole-window actions, and writes
+   UTC start/end markers per step (`markers.jsonl`) plus what arrived on the
+   Windows side (`results.json`):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\windows_capture.ps1          # -List shows the steps, -From <id> resumes
+   ```
 4. Stop and filter.  QEMU resets the device when it attaches, so check the
    device table: if the Wormhole shows up under more than one `Bus:Dev`,
    keep each one (`--device` is repeatable).
