@@ -924,6 +924,21 @@ class TestHidSendPairingCaptures(unittest.TestCase):
             "no matching accepted 0xD9 send in the analysed packets", blob)
         self.assertNotIn("other cable end", blob)
 
+    def test_pairing_lines_name_the_capture(self):
+        # Frame numbers and bus:dev are per capture, so with --peer each
+        # PAIRED line says which capture the report and the send are in.
+        lines = wp._fmt_pairing(self.merged_pairing)
+        paired = [l for l in lines if l.lstrip().startswith("PAIRED")]
+        self.assertEqual(len(paired), 10)
+        x60 = [l for l in paired if "hex=003c0000" in l]
+        self.assertEqual(len(x60), 1)
+        self.assertIn("report main 3:15 f131 ", x60[0])
+        self.assertIn("<- send peer 1:6 f131 ", x60[0])
+        orphan = [l for l in wp._fmt_pairing(self.live3_pairing)
+                  if l.lstrip().startswith("ORPHAN")]
+        self.assertEqual(len(orphan), 1)
+        self.assertIn("report main 3:15 f131 ", orphan[0])
+
     def test_pairing_output_is_json_serialisable(self):
         blob = json.dumps(self.merged_pairing, sort_keys=True)
         self.assertIn("003c0000", blob)
