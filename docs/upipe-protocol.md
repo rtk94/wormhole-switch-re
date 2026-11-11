@@ -123,8 +123,8 @@ Client side (`THMGBClient`) handles `0xa1`–`0xa9` and `0xad`, starting with
 `0xa1` ResponseResult. `0x39` is `XmlPacketCommand`; `OTiCommand doCommand:`
 drops it while the server is not connected. Login, ResponseResult, the
 clipboard and drive-list forms of XmlPacket, the file download, the remote
-browser, MakeNewDirectory and the upload are decoded below; other payloads
-are not.
+browser, the file operations and the upload are decoded below; other
+payloads are not.
 
 Command IDs recovered so far (not exhaustive), from each class's `init`
 (`setCommandID:`) in the decompiled GoBridgeDemon:
@@ -134,15 +134,18 @@ Command IDs recovered so far (not exhaustive), from each class's `init`
 | `0x01` | Login | `0x39` | XmlPacket |
 | `0x02` | Logout | `0xa1` | ResponseResult |
 | `0x04` | GetDirectoryInfo | `0xa2` | DirectoryInfo |
-| `0x07` | MakeNewDirectory | `0xa3` | DownloadFileData |
-| `0x0a` | UploadFile | `0xa4` | DriveInfo |
-| `0x0c` | UploadFileData | `0xa7` | DownloadMultiFileFinished |
-| `0x0d` | UploadFileAbort | `0xa8` | UploadMultiFileConfirmation |
-| `0x10` | DownloadMultipleFile | `0xa9` | UploadMultiFileError |
-| `0x11` | DownloadMultipleFileAbort | `0xaa` | UploadMultiFileConfirmationExt |
-| `0x12` | UploadMultipleFile | `0xad` | DomainFolders |
-| `0x13` | UploadMultipleFileConfirm | `0x34` | SyncDynamic |
-| `0x14` | UploadMultipleFileAbort | `0x37` | ChangeFileAttribute |
+| `0x06` | DeleteDirectory | `0xa3` | DownloadFileData |
+| `0x07` | MakeNewDirectory | `0xa4` | DriveInfo |
+| `0x08` | DeleteFile | `0xa7` | DownloadMultiFileFinished |
+| `0x09` | RenameFile | `0xa8` | UploadMultiFileConfirmation |
+| `0x0a` | UploadFile | `0xa9` | UploadMultiFileError |
+| `0x0c` | UploadFileData | `0xaa` | UploadMultiFileConfirmationExt |
+| `0x0d` | UploadFileAbort | `0xad` | DomainFolders |
+| `0x10` | DownloadMultipleFile | `0x34` | SyncDynamic |
+| `0x11` | DownloadMultipleFileAbort | `0x37` | ChangeFileAttribute |
+| `0x12` | UploadMultipleFile | | |
+| `0x13` | UploadMultipleFileConfirm | | |
+| `0x14` | UploadMultipleFileAbort | | |
 | `0x15` | UploadMultipleFileZeroLength | | |
 
 ### OS byte
@@ -363,15 +366,40 @@ folder's disclosure triangle, and the Mac's refresh after every paste, send a
 new `0x04` for that path. On error the server sends ResponseResult result 1,
 error code 3, and no `0xa2`.
 
-### MakeNewDirectory (`0x07`)
+### File operations: New Folder, rename, Move to Trash
+
+All three are requests to the server, which answers each with a
+ResponseResult for that command (session 0; result 0 on success, 1 on
+failure), then the Mac re-lists the folder with `0x04`. Paths are UTF-16
+with a NUL counted in the length.
 
 ```
-07 <sessionID u32> <pathLen u16> <path UTF-16 + NUL>
+07 <sessionID u32> <pathLen u16> <path>                       MakeNewDirectory
+09 <sessionID u32> <oldLen u16> <newLen u16> <old> <new>      RenameFile
+08 <sessionID u32> <pathLen u16> <path>                       DeleteFile
+06 <sessionID u32> <pathLen u16> <path>                       DeleteDirectory
 ```
 
-Before every paste the Mac sends one for the destination folder itself, with
-the upload's session ID. The server creates it if needed and answers
-ResponseResult (`requestCommand` 7, session 0, result 0).
+- **New Folder** (File menu) sends `0x07` for `untitled folder` in the folder
+  being viewed (a selected subfolder is not used). The Mac picks the name: with
+  `untitled folder` present it sent `untitled folder 2`. Before every paste
+  it also sends `0x07` for the destination folder itself, with the upload's
+  session ID, so an existing folder must count as success.
+- **Rename** (edit the name in place) sends `0x09` with session 0 and both
+  full paths. On result 1 Wormhole.app shows `Fail to rename file "<old
+  name>"!` and keeps the old name. The Mac's server sets error code and tag
+  `ErrStr` on failure; `upipe_peer.py` sends error code 3.
+- **Move to Trash** (File menu) first asks `The item will be deleted
+  immediately. Are you sure you want to continue?`. For a file it sends
+  `0x08` (session 0). For a folder it walks the tree itself: `0x04` for each
+  folder, `0x08` for each file in it, then `0x06` for the emptied folder (seen
+  with session 103). The Mac's own server (`handleDeleteFile:`,
+  `handleRemoveDirectory:`) calls `moveToTrash:` and answers result 0 or 1
+  with no error code, so despite the warning nothing is deleted outright.
+  `upipe_peer.py` does the same with the freedesktop.org home Trash
+  (`$XDG_DATA_HOME/Trash`, default `~/.local/share/Trash`: the item goes to
+  `files/`, a `.trashinfo` record to `info/`), so file managers can restore
+  it.
 
 ### Upload: Mac → shared folder
 
@@ -446,10 +474,13 @@ big-endian; it exists only to reproduce the crash below. `--offer` serves
 only the offered files (anything else gets `0xa9`, code 6), re-reading each
 file when the request arrives, and exits once a request is answered.
 `--share` (repeatable) runs for `--seconds`. It lists, serves, creates
-folders and accepts uploads only inside the shared folders, after resolving
-symlinks. A request it cannot parse gets ResponseResult result 1 instead of
-stopping the tool. When the Mac logs out (Wormhole.app restarted), the tool
-logs in again and resends the drive list.
+folders, renames, trashes and accepts uploads only inside the shared folders,
+after resolving symlinks. It never renames onto an existing name, and never
+renames or trashes a shared folder itself. Trashing a symlink moves the link,
+not its target. A request it cannot parse gets ResponseResult result 1
+instead of stopping the tool. When the Mac logs out (Wormhole.app
+restarted), the tool logs in again once the restarted daemon logs in, and
+resends the drive list.
 
 Mac-side tracing uses `tools/gobridge_scsi.d` (dtrace on GoBridgeDemon's
 `SCSITaskClass` calls; usage in the script header). It needs root, so it
@@ -477,6 +508,7 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `upload` (Finder copy, Paste in the remote browser) | `0x07`, `0x13` (100 000 bytes) → `0xa8`, a 101-byte `0x12`, one `0x0c`, then our `0xa7` and the Mac's refresh. SHA-256 matches. The first try crashed the tool: it parsed `0x12` with `0x13`'s layout. The Mac's window then stayed busy until Wormhole.app was restarted |
 | `upload…big`, `upload…two` | 20 MiB: three `0x0c` (8, 8, 4 MiB), about 1.3 s from `0x12` to the last piece (~16.5 MB/s). Two files in one paste: one `0x13`/`0x12` pair listing both, the pieces file by file, one `0xa7`. All hashes match |
 | `upload…exists` (same file pasted again) | `0xa8` lists the file's ID; the Mac shows its replace dialog. Don't Replace: no `0x12`, file unchanged. Replace: `0x12`, `0x0c`, file overwritten (hash matches) |
+| `fileops` (`--share`, File menu and in-place rename on the Mac) | Move to Trash on a file: `0x08` (105 bytes, session 0) → result 0, the file lands in the test Trash with its `.trashinfo`. On a folder with one file: `0x04` for it, `0x08` for the file, `0x06` for the folder (session 103). Rename: `0x09` (213 bytes) → result 0, renamed. Rename onto an existing folder: result 1, error code 3; the Mac shows `Fail to rename file …!` and nothing changes. New Folder twice: `0x07` for `untitled folder`, then `untitled folder 2` |
 | `sharedl` (Copy in the remote browser, Paste in Finder) | The Mac sends `0x10` for the shared path; ResponseResult, `0xa3`, `0xa7`; the Mac logs `Did download 1 files`. SHA-256 matches |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
@@ -497,8 +529,8 @@ because they contain the Mac's host name.
   Mac abandoned the drag).
 - The `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`) and when the
   Mac uses it; other `0xa9` error codes.
-- Rename, delete and New Folder from the remote browser: which commands
-  they use (`0x37` ChangeFileAttribute is one candidate).
+- `0x37` ChangeFileAttribute: the Mac logs `setAttribute: 0` after each
+  downloaded file but sent none in the tests.
 - `0x0a` UploadFile, `0x0d`, `0x15` (zero-length upload) and `0xaa`: when
   the Mac uses them.
 - `0xa6` (zero-length file) and `0xa5`/`0xab`: `--offer` sends an empty file

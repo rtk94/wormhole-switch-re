@@ -47,12 +47,12 @@ The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and veri
 
 - [x] Capture live peer-active session with clipboard copy and file transfer — Linux ↔ macOS, 2026-11-11, with `tools/upipe_peer.py` on Linux and `tools/gobridge_scsi.d` (dtrace) on the Mac. No usbmon capture of it is published: the Login packet carries the Mac's host name (#7)
 - [x] Identify UPipe CDB magic byte(s) — `0xD8` poll, `0xD9 0x28` fetch, `0xD9 0x2A` send
-- [ ] Decode UPipe framing and commands — packet tail, chunk header, terminator, Login (`0x01`), ResponseResult (`0xa1`), clipboard XmlPacket (`0x39`: text and file metadata) and file download (`0x10` → `0xa1`/`0xa3`/`0xa7`, `0xa9` on error), drive list, remote browser (`0x04` → `0xa2`), MakeNewDirectory (`0x07`) and upload (`0x13` → `0xa8`, `0x12`, `0x0c` → `0xa7`) decoded; rename, delete and New Folder from the remote browser, image clipboard formats and `MultipleFilePackage` open (#9)
+- [ ] Decode UPipe framing and commands — packet tail, chunk header, terminator, Login (`0x01`), ResponseResult (`0xa1`), clipboard XmlPacket (`0x39`: text and file metadata) and file download (`0x10` → `0xa1`/`0xa3`/`0xa7`, `0xa9` on error), drive list, remote browser (`0x04` → `0xa2`), upload (`0x13` → `0xa8`, `0x12`, `0x0c` → `0xa7`) and the file operations (New Folder `0x07`, rename `0x09`, Move to Trash `0x08`/`0x06`) decoded; image clipboard formats and `MultipleFilePackage` open (#9)
 - [x] Verify bidirectional symmetry (PC A → PC B vs PC B → PC A) — clipboard text and file clipboard + download verified both ways; the Mac pastes files served by `tools/upipe_peer.py --offer` (SHA-256 checked up to 20 MiB, and the `0xa9` error path) (#9)
 - [x] `tools/wormhole_parse.py` decodes UPipe: poll state, chunk headers and the reassembled commands, reusing the `tools/upipe_peer.py` decoders (#8)
 - [x] Document in `docs/transport.md` (new section) + new `docs/upipe-protocol.md`
 
-**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`), file download from the Mac (`--download`), serving files the Mac pastes (`--offer`), and sharing folders (`--share`) that Wormhole.app browses, copies from and uploads into (SHA-256 checked up to 20 MiB, two files per paste, replace prompt). `tools/wormhole_parse.py` decodes UPipe in usbmon captures. Remaining: rename, delete and New Folder.
+**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`), file download from the Mac (`--download`), serving files the Mac pastes (`--offer`), and sharing folders (`--share`) that Wormhole.app browses, copies from, uploads into (SHA-256 checked up to 20 MiB, two files per paste, replace prompt), renames in, creates folders in and moves to the Trash from. `tools/wormhole_parse.py` decodes UPipe in usbmon captures. Remaining: image clipboard formats and `MultipleFilePackage`.
 
 ---
 
@@ -117,7 +117,7 @@ Host-side observations resolved several firmware-adjacent questions without need
 
 The capture method is in `docs/upipe-protocol.md` (Linux peer tool + Mac dtrace tracer). Remaining steps:
 
-1. Decode rename, delete and New Folder from the remote browser (candidates: `0x37` ChangeFileAttribute, `0x07`): trigger them on the Mac, add to `tools/upipe_peer.py`, verify live.
+1. Decode the remaining clipboard forms: image formats and `MultipleFilePackage`. Find what makes the Mac send them, add to `tools/upipe_peer.py`, verify live.
 2. Repeat against a Windows peer for parity (v0.5).
 
-Uploads are done (#9); v0.4 closes once those file operations are.
+Uploads and file operations are done (#9); what remains for v0.4 is step 1.

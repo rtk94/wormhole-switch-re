@@ -44,6 +44,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import struct
 import sys
 import time
@@ -74,7 +75,10 @@ STATES = {
 CMD_LOGIN = 0x01
 CMD_LOGOUT = 0x02
 CMD_GET_DIRECTORY_INFO = 0x04
+CMD_DELETE_DIRECTORY = 0x06
 CMD_MAKE_NEW_DIRECTORY = 0x07
+CMD_DELETE_FILE = 0x08
+CMD_RENAME_FILE = 0x09
 CMD_UPLOAD_FILE_DATA = 0x0C
 CMD_UPLOAD_MULTI = 0x12
 CMD_UPLOAD_CONFIRM = 0x13
@@ -568,6 +572,10 @@ def describe_command(cmd, endian=">"):
             out["path"] = decode_get_directory_info(cmd, endian)
         elif cmd[0] == CMD_MAKE_NEW_DIRECTORY:
             out.update(decode_make_new_directory(cmd, endian))
+        elif cmd[0] in (CMD_DELETE_FILE, CMD_DELETE_DIRECTORY):
+            out.update(decode_delete(cmd, endian))
+        elif cmd[0] == CMD_RENAME_FILE:
+            out.update(decode_rename(cmd, endian))
         elif cmd[0] == CMD_UPLOAD_CONFIRM:
             out.update(decode_upload_files(cmd, endian))
         elif cmd[0] == CMD_UPLOAD_MULTI:
@@ -789,6 +797,121 @@ def _decode_upload_paths(cmd, off, count, endian):
     return files
 
 
+def _utf16(endian):
+    return "utf-16-be" if endian == ">" else "utf-16-le"
+
+
+def encode_delete(command, session_id, path, endian=">"):
+    raw = (path + "\0").encode(_utf16(endian))
+    return bytes([command]) + struct.pack(endian + "IH", session_id, len(raw)) + raw
+
+
+def decode_delete(cmd, endian=">"):
+    """DeleteFile (0x08) / DeleteDirectory (0x06):
+    <sessionFileID u32> <pathLen u16> <path, UTF-16>."""
+    if len(cmd) < 7 or cmd[0] not in (CMD_DELETE_FILE, CMD_DELETE_DIRECTORY):
+        raise ValueError("not a DeleteFile/DeleteDirectory")
+    session_id, n = struct.unpack(endian + "IH", cmd[1:7])
+    if 7 + n > len(cmd):
+        raise ValueError("delete path truncated")
+    return {"session_id": session_id,
+            "path": cmd[7:7 + n].decode(_utf16(endian)).rstrip("\0")}
+
+
+def encode_rename(session_id, path, new_path, endian=">"):
+    old, new = ((p + "\0").encode(_utf16(endian)) for p in (path, new_path))
+    return (bytes([CMD_RENAME_FILE]) + struct.pack(endian + "IHH", session_id, len(old), len(new))
+            + old + new)
+
+
+def decode_rename(cmd, endian=">"):
+    """RenameFile (0x09): <sessionFileID u32> <originalLen u16> <newLen u16>
+    <original path> <new path>, both UTF-16."""
+    if len(cmd) < 9 or cmd[0] != CMD_RENAME_FILE:
+        raise ValueError("not a RenameFile")
+    session_id, n_old, n_new = struct.unpack(endian + "IHH", cmd[1:9])
+    if 9 + n_old + n_new > len(cmd):
+        raise ValueError("rename paths truncated")
+    old = cmd[9:9 + n_old].decode(_utf16(endian)).rstrip("\0")
+    new = cmd[9 + n_old:9 + n_old + n_new].decode(_utf16(endian)).rstrip("\0")
+    return {"session_id": session_id, "path": old, "new_path": new}
+
+
+def default_trash_dir():
+    """The freedesktop.org home trash, where file managers look for it."""
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data, "Trash")
+
+
+def move_to_trash(path, trash):
+    """Move path into trash/files with a trash/info/<name>.trashinfo record
+    (freedesktop.org Trash spec), as the Mac's server moves items to its Trash."""
+    from urllib.parse import quote
+    files, info = os.path.join(trash, "files"), os.path.join(trash, "info")
+    os.makedirs(files, exist_ok=True)
+    os.makedirs(info, exist_ok=True)
+    base = os.path.basename(path.rstrip("/"))
+    stem, ext = os.path.splitext(base)
+    name, n = base, 1
+    while True:
+        try:        # O_EXCL claims the name, so two deletes cannot pick the same one
+            fd = os.open(os.path.join(info, name + ".trashinfo"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            n += 1
+            name = "%s.%d%s" % (stem, n, ext)
+    with os.fdopen(fd, "w") as f:
+        f.write("[Trash Info]\nPath=%s\nDeletionDate=%s\n"
+                % (quote(path), time.strftime("%Y-%m-%dT%H:%M:%S")))
+    try:
+        shutil.move(path, os.path.join(files, name))
+    except OSError:
+        os.unlink(os.path.join(info, name + ".trashinfo"))
+        raise
+
+
+def _entry_in_share(path, roots):
+    """The entry path names (its folder resolved, the entry itself not, so a
+    symlink is acted on, not its target) if it lies inside a share and is not
+    a share itself; else None."""
+    parent = shared_path(os.path.dirname(path.rstrip("/")) or "/", roots)
+    if parent is None:
+        return None
+    entry = os.path.join(parent, os.path.basename(path.rstrip("/")))
+    if not os.path.islink(entry) and any(os.path.realpath(entry) == os.path.realpath(r)
+                                         for r in roots):
+        return None
+    return entry
+
+
+def serve_delete(cmd, roots, trash, endian="<", request_endian=">"):
+    """Move to Trash from the remote browser.  THMGBServer answers result 0
+    on success, 1 otherwise, with no error code."""
+    target = _entry_in_share(decode_delete(cmd, request_endian)["path"], roots)
+    try:
+        if target is None or not os.path.lexists(target):
+            raise OSError("not shared")
+        move_to_trash(target, trash)
+    except OSError:
+        return [encode_response(cmd[0], 1, endian=endian)]
+    return [encode_response(cmd[0], 0, endian=endian)]
+
+
+def serve_rename(cmd, roots, endian="<", request_endian=">"):
+    """Rename within the shares; never onto an existing name."""
+    req = decode_rename(cmd, request_endian)
+    old, new = (_entry_in_share(req[k], roots) for k in ("path", "new_path"))
+    try:
+        if old is None or new is None or not os.path.lexists(old) or os.path.lexists(new):
+            raise OSError("cannot rename")
+        os.rename(old, new)
+    except OSError:
+        return [encode_response(CMD_RENAME_FILE, 1, error_code=REMOTE_OPERATION_ERROR,
+                                endian=endian)]
+    return [encode_response(CMD_RENAME_FILE, 0, endian=endian)]
+
+
 def decode_upload_files(cmd, endian=">"):
     """UploadMultipleFileConfirm (0x13): <multiSessionID u32> <allFileSize u64>
     <largeFilesCount u16> <count u16> then the destination paths."""
@@ -903,20 +1026,24 @@ class UploadReceiver:
         return []
 
 
-def server_replies(cmd, roots, resolver, uploads=None):
+def server_replies(cmd, roots, resolver, uploads=None, trash=None):
     """Replies, as (command, why), to a request the peer sent our server side.
     Only shared folders are browsed or changed, only resolvable files served.
     A request we cannot parse gets ResponseResult(cmd, 1) instead of an exception."""
     if not cmd:
         return []
     try:
-        return _server_replies(cmd, roots, resolver, uploads)
+        return _server_replies(cmd, roots, resolver, uploads, trash)
     except ValueError:
         return [(encode_response(cmd[0], 1, error_code=REMOTE_OPERATION_ERROR, endian="<"),
                  "error")]
 
 
-def _server_replies(cmd, roots, resolver, uploads):
+def _server_replies(cmd, roots, resolver, uploads, trash):
+    if roots and cmd[0] in (CMD_DELETE_FILE, CMD_DELETE_DIRECTORY):
+        return [(r, "delete") for r in serve_delete(cmd, roots, trash or default_trash_dir())]
+    if roots and cmd[0] == CMD_RENAME_FILE:
+        return [(r, "rename") for r in serve_rename(cmd, roots)]
     if roots and cmd[0] == CMD_GET_DIRECTORY_INFO:
         return [(r, "browse") for r in serve_get_directory_info(cmd, roots)]
     if roots and cmd[0] == CMD_MAKE_NEW_DIRECTORY:
@@ -1003,8 +1130,9 @@ def main(argv):
                          "answered")
     ap.add_argument("--share", metavar="LOCAL_DIR", action="append",
                     help="with --login: show this folder as a drive in Wormhole.app's remote "
-                         "browser, list its folders and serve its files (repeatable); runs "
-                         "for --seconds")
+                         "browser: list, copy from, upload into, rename, create folders; "
+                         "Move to Trash goes to the freedesktop.org Trash (repeatable); "
+                         "runs for --seconds")
     ap.add_argument("--download", metavar="PEER_PATH", action="append",
                     help="with --login: ask the peer to send this file (repeatable); "
                          "saved as download_<n>.bin in --out; exits when the peer "
@@ -1030,6 +1158,7 @@ def main(argv):
     fetch, send = build_fetch_cdb(), build_send_cdb()
     framer, reasm, txq = Framer(), Reassembler(), []
     after_login_sent = False
+    relogin = False                     # set by a Logout from the peer
     endian = ">" if args.endian == "big" else "<"
     started = set()                     # file IDs whose download file we have opened
     # Paths as the peer will ask for them -> local files; only these are served.
@@ -1095,9 +1224,14 @@ def main(argv):
                     emit({"event": "command", **desc, "cmd_head": cmd[:64].hex()})
                     print("command", desc, flush=True)
                     # The peer logged out (e.g. Wormhole.app restarted): log in
-                    # again so the after-login commands (drive list) go out anew.
+                    # again when its restarted daemon logs in (a Login sent
+                    # straight after the Logout reaches no one), so the
+                    # after-login commands (drive list) go out anew.
                     if args.login and cmd[:1] == bytes([CMD_LOGOUT]):
                         after_login_sent = False
+                        relogin = True
+                    elif relogin and cmd[:1] == bytes([CMD_LOGIN]):
+                        relogin = False
                         queue(encode_login(args.login, os_byte), "relogin")
                     if args.login and cmd[:1] == bytes([CMD_LOGIN]):
                         queue(encode_response(CMD_LOGIN, 0, os_byte), "login-response")
