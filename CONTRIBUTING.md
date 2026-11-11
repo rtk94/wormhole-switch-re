@@ -23,6 +23,7 @@ This is a **documentation and reverse-engineering research** repository. There i
    python3 -m unittest tools.test_wormhole_parse
    python3 -m unittest tools.test_filter_usbmon
    python3 -m unittest tools.test_peer_rerun_send
+   python3 -m unittest tools.test_upipe_peer
    ```
 3. If you add parser support for a new packet type, add a test case in `tools/test_wormhole_parse.py`.
 4. Update relevant docs in `docs/` (cross-link with `[link](path.md)`).
@@ -42,7 +43,9 @@ This is a **documentation and reverse-engineering research** repository. There i
 - `tools/wormhole_parse.py` — single-file, stdlib-only parser. New features should preserve zero-dependency property.
 - `tools/filter_usbmon.py` — keeps only one device's transactions from a raw usbmon pcap.
 - `tools/peer_rerun_send.py` — logged send driver for peer→local re-run tests (uses `sg_raw` + direct `SG_IO`).
-- All tools have unittest suites. New code needs tests.
+- `tools/upipe_peer.py` — Linux GoBridge peer over UPipe (SG_IO); its decoders are shared with the parser.
+- `tools/gobridge_scsi.d` — dtrace tracer for GoBridgeDemon's SCSI tasks on macOS.
+- All Python tools have unittest suites. New code needs tests.
 
 ## License
 

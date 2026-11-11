@@ -662,6 +662,8 @@ because they contain the Mac's host name.
 
 ## Open questions
 
+Mac-side items are tracked in #51; the Windows formats and parity in #50.
+
 - Drag-and-drop: what it needs from the peer (likely the mouse/KM side; the
   Mac abandoned the drag).
 - Other `0xa9` error codes.

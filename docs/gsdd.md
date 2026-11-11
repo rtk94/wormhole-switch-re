@@ -209,6 +209,9 @@ algorithm cannot even be identified until the cipher is recovered
 
 ### What remains to extract `Wormhole.exe` / `LinkEngKM.exe`
 
+Route 3 is being taken in a Windows KVM guest with the cable passed through
+(`docs/reproduction.md` §6.6), tracked in #48.
+
 1. Obtain `OTiEncrypt.dll` (from a live Wormhole install / vendor media) and reuse
    its exported `DecryptBuffer` via Wine/Frida on the extracted record buffers,
    or

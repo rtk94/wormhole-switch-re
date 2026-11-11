@@ -155,10 +155,13 @@ Ghidra 12.1.4 `binary_overview` on the unpacked DLL:
 Chain, end to end: SKLoader extracts this OTiArchive DLL resource
 (`FUN_00401a2e`) → loads it dynamically → `ArchiveTree*` extracts the
 `GSDD` / `Deployment` payloads → `CreateAppProcess` / `ShellExecuteA("open")`
-launches the extracted app (`ImageRoot.exe`, `GoLink`). The actual
-peer-to-peer transfer logic remains in the signed `GSDD` payloads and the
-cable-internal link — still **unknown** from single-host static analysis,
-but neither host binary talks USB directly.
+launches the extracted app (the strings say `ImageRoot.exe` and `GoLink`;
+`docs/gsdd.md` shows `ImageRoot` is the archive's root folder and the
+executables are `Wormhole.exe`, `LinkEngKM.exe`, …). The actual
+peer-to-peer transfer logic remains in the encrypted `GSDD` payloads and the
+cable-internal link — still **unknown** from static analysis of the shipped
+files, but neither host binary talks USB directly.  Recovering those payloads
+from a VM install is #48; their analysis is #49.
 
 ## Authenticode (SKLoader.exe)
 
