@@ -63,7 +63,7 @@ macOS GoBridgeDemon is analysed to function level (`docs/mac-gobridge.md`). On W
 - [x] `GSDD.zz` / `GSDD.lst` container format — encryption/compression, role in SKLoader deployment (#10)
 - [x] Embedded DLL unpacked and decompiled: `ArchiveTreeLib.dll` (OTiArchive), archive/GUI/registry code, no `DeviceIoControl` (`docs/pe-analysis.md`)
 - [x] Analyse `Wormhole.app` UI (macOS frontend) — `docs/wormhole-app-ui.md` (#12)
-- [ ] Recover the Windows binaries from a VM install, with `OTiEncrypt.dll` if it is written out (#48)
+- [x] Recover the Windows binaries from a VM install (#48): all `GSDD` records decrypted, install footprint and hashes in `docs/windows-gobridge.md`; `OTiEncrypt.dll` did not turn up
 - [ ] Function-level analysis: SCSI pass-through, `SendInput`/hooks vs macOS `CGEvent`, UPipe handlers (#49)
 - [ ] Windows peer capture: `0xD9` HID and UPipe parity, Windows-only clipboard formats (DIB, RTF, HTML, multiple images) (#50)
 
@@ -108,7 +108,7 @@ Host-side observations resolved several firmware-adjacent questions without need
 | v0.2 | SCSI / Mass Storage | ✅ Done | — |
 | v0.3 | ISO payload & host inventory | ✅ Done | — |
 | v0.4 | UPipe protocol | ✅ Done | — |
-| v0.5 | **Windows host parity** | 🔄 **In progress** | Windows binaries from a VM install (#48) |
+| v0.5 | **Windows host parity** | 🔄 **In progress** | Windows analysis (#49) and peer capture (#50) |
 | v0.6 | Firmware internals | 🔄 Partially resolved | Long-term (#14) |
 | v1.0 | Stable reference release | 📋 Planned | When v0.5 lands and #51–#54 close |
 
@@ -120,8 +120,8 @@ GitHub milestones use the same names; [#23](https://github.com/rtk94/wormhole-sw
 
 v0.4 is done (#9). Critical path:
 
-1. **#48** — install the Windows software in a KVM guest (`docs/reproduction.md` §6.6) and recover the binaries `GSDD.zz` keeps encrypted.
-2. **#49** (static analysis) and **#50** (Windows peer capture), in parallel once #48 lands.
+1. ~~**#48**~~ — done: the Windows binaries are recovered (`docs/windows-gobridge.md`).
+2. **#49** (static analysis) and **#50** (Windows peer capture), in parallel.
 3. **#52** protocol spec, then **#53**, **#54** and the `v1.0` tag.
 
 Any time: **#51** on the existing Mac rig, and **#14** with both ends on one host.
