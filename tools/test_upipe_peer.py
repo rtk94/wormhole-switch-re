@@ -250,6 +250,34 @@ class TestNodeInfo(unittest.TestCase):
         self.assertEqual([n["path"] for n in u.decode_clipboard(xml)["nodes"]],
                          [self.PATH, "/\\b"])
 
+    # The Mac's image copy (img run): temp files under a 51-character
+    # /\var\folders\…\-Tmp-\ prefix; this one has the same lengths.
+    IMG_DIR = "/\\" + "v" * 48 + "\\"
+    IMG_TIFF, IMG_BMP = IMG_DIR + "CBContent.tmp", IMG_DIR + "CBBitmapContent.tmp"
+
+    def test_clipboard_image_packet_matches_mac_size(self):
+        self.assertEqual((len(self.IMG_DIR), len(self.IMG_TIFF), len(self.IMG_BMP)), (51, 64, 70))
+        cmd = u.encode_clipboard_image(self.IMG_TIFF, self.IMG_BMP)
+        self.assertEqual(len(cmd), 1024)
+        xml = u.decode_xml_packet(cmd)
+        self.assertIn("<OTIMSG><CP_Content_Text></CP_Content_Text><CP_Content_Bitmap_ImageFile>", xml)
+        d = u.describe_command(cmd)
+        self.assertEqual((d["cb_format"], d["image_file"], d["bitmap_file"]),
+                         ("Apple TIFF Format", self.IMG_TIFF, self.IMG_BMP))
+
+    def test_clipboard_image_without_bitmap_omits_the_element(self):
+        # An empty CP_Content_Bitmap_ImageFile crashed GoBridgeDemon
+        # (ConvertHexStringToPath on ""); without the element it is skipped.
+        xml = u.decode_xml_packet(u.encode_clipboard_image("/tmp/a.tiff"))
+        self.assertNotIn("CP_Content_Bitmap_ImageFile", xml)
+        self.assertIn("<CP_Content_Text></CP_Content_Text><CP_Content_ImageFile>", xml)
+        self.assertNotIn("bitmap_file", u.decode_clipboard(xml))
+
+    def test_mac_temp_path_to_posix(self):
+        self.assertEqual(u.posix_path("/\\var\\folders\\pD\\x+++TI\\-Tmp-\\CBContent.tmp"),
+                         "/var/folders/pD/x+++TI/-Tmp-/CBContent.tmp")
+        self.assertEqual(u.posix_path("/home/user/a.png"), "/home/user/a.png")
+
     def test_offer_file_reads_local_metadata(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -289,11 +317,39 @@ class TestDescribeEndian(unittest.TestCase):
         self.assertEqual(d["session_id"], 103)
 
 
+class TestImageFetcher(unittest.TestCase):
+    """--save-clipboard-images: fetch each image the Mac copies."""
+
+    def test_requests_the_image_file_as_posix_path(self):
+        f = u.ClipboardImageFetcher()
+        cmd = f.request("/\\var\\folders\\x\\CBContent.tmp")
+        req = u.decode_download_request(cmd, "<")
+        self.assertEqual(req["multi_session_id"], 1001)
+        self.assertEqual(req["files"], [{"file_id": 1001, "path": "/var/folders/x/CBContent.tmp"}])
+        self.assertEqual(f.filename(1001), "clipboard_1.tiff")
+
+    def test_ids_and_names_count_up(self):
+        f = u.ClipboardImageFetcher()
+        f.request("/a")
+        req = u.decode_download_request(f.request("/b"), "<")
+        self.assertEqual(req["files"][0]["file_id"], 1002)
+        self.assertEqual(f.filename(1002), "clipboard_2.tiff")
+        self.assertIsNone(f.filename(1))
+
+
 class TestAfterLogin(unittest.TestCase):
     """What the peer queues once the Mac accepts our Login."""
 
     def test_nothing_by_default(self):
         self.assertEqual(u.after_login_commands(), [])
+
+    def test_image_offered_by_absolute_path(self):
+        cmds = u.after_login_commands(image="pic.tiff")
+        self.assertEqual([why for _, why in cmds], ["image"])
+        d = u.describe_command(cmds[0][0])
+        self.assertEqual((d["cb_format"], d["image_file"]),
+                         ("Apple TIFF Format", os.path.abspath("pic.tiff")))
+        self.assertNotIn("bitmap_file", d)
 
     def test_order_clipboard_offer_download(self):
         import tempfile
@@ -404,6 +460,73 @@ class TestServeDownload(unittest.TestCase):
         cmds = u.serve_download(req, self.offered)
         self.assertEqual([c[0] for c in cmds], [0xA1, 0xA3, 0xA7])
         self.assertEqual(struct.unpack("<IIII", cmds[1][1:17]), (5, 1, 1, 0))
+
+
+class TestMultipleFilePackage(unittest.TestCase):
+    """MultipleFilePackage (0x3a): several 0xa3 in one command (pkg run)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.offered = {}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def file(self, name, data):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        self.offered[path] = path
+        return path
+
+    def test_layout(self):
+        a = u.encode_file_data(1, 1, 1, b"ab")
+        b = u.encode_file_data(2, 1, 1, b"cde")
+        pkg = u.encode_multiple_file_package([a, b])
+        # 3a <count u32, little-endian: the Mac reads it unswapped> <11 bytes> <commands>
+        self.assertEqual(pkg[:16], bytes([0x3A, 2, 0, 0, 0]) + bytes(11))
+        self.assertEqual(pkg[16:], a + b)
+        self.assertEqual(u.decode_multiple_file_package(pkg, "<"), [a, b])
+        d = u.describe_command(pkg, "<")
+        self.assertEqual((d["command_name"], d["count"]), ("MultipleFilePackage", 2))
+        self.assertEqual([c["file_id"] for c in d["commands"]], [1, 2])
+
+    def test_decode_truncated(self):
+        pkg = u.encode_multiple_file_package([u.encode_file_data(1, 1, 1, b"abc")])
+        with self.assertRaises(ValueError):
+            u.decode_multiple_file_package(pkg[:-1], "<")
+
+    def test_small_files_go_in_one_package(self):
+        a, b = self.file("a", b"x" * 3000), self.file("b", b"y" * 5000)
+        cmds = u.serve_download(mac_download_request(102, [(102, a), (103, b)]), self.offered)
+        self.assertEqual([c[0] for c in cmds], [0xA1, 0x3A, 0xA7])
+        subs = [u.decode_file_data(c, "<") for c in
+                u.decode_multiple_file_package(cmds[1], "<")]
+        self.assertEqual([(s["file_id"], s["data"]) for s in subs],
+                         [(102, b"x" * 3000), (103, b"y" * 5000)])
+
+    def test_one_small_file_or_a_split_file_stays_bare(self):
+        a = self.file("a", b"x" * 10)
+        cmds = u.serve_download(mac_download_request(1, [(1, a)]), self.offered)
+        self.assertEqual([c[0] for c in cmds], [0xA1, 0xA3, 0xA7])
+        big, small = self.file("big", b"z" * 9000), self.file("s", b"s")
+        cmds = u.serve_download(mac_download_request(2, [(2, big), (3, small)]),
+                                self.offered, piece=4096)
+        self.assertEqual([c[0] for c in cmds], [0xA1, 0xA3, 0xA3, 0xA3, 0xA3, 0xA7])
+
+    def test_packages_stay_under_the_piece_limit(self):
+        paths = [self.file(n, b"q" * 3000) for n in "abcde"]
+        req = mac_download_request(1, [(i, p) for i, p in enumerate(paths, 1)])
+        cmds = u.serve_download(req, self.offered, piece=7000)
+        self.assertEqual([c[0] for c in cmds], [0xA1, 0x3A, 0x3A, 0xA3, 0xA7])
+        self.assertEqual([len(u.decode_multiple_file_package(c, "<")) for c in cmds[1:3]], [2, 2])
+
+    def test_package_off(self):
+        a, b = self.file("a", b"1"), self.file("b", b"2")
+        cmds = u.serve_download(mac_download_request(1, [(1, a), (2, b)]), self.offered,
+                                package=False)
+        self.assertEqual([c[0] for c in cmds], [0xA1, 0xA3, 0xA3, 0xA7])
 
 
 class TestCommandTable(unittest.TestCase):

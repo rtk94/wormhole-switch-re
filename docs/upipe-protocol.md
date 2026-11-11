@@ -143,7 +143,7 @@ Command IDs recovered so far (not exhaustive), from each class's `init`
 | `0x0d` | UploadFileAbort | `0xad` | DomainFolders |
 | `0x10` | DownloadMultipleFile | `0x34` | SyncDynamic |
 | `0x11` | DownloadMultipleFileAbort | `0x37` | ChangeFileAttribute |
-| `0x12` | UploadMultipleFile | | |
+| `0x12` | UploadMultipleFile | `0x3a` | MultipleFilePackage |
 | `0x13` | UploadMultipleFileConfirm | | |
 | `0x14` | UploadMultipleFileAbort | | |
 | `0x15` | UploadMultipleFileZeroLength | | |
@@ -262,6 +262,42 @@ The XML is one line; indented here:
   non-ASCII and non-BMP characters (`é ✓ 日本語 😀`) and `\n` line breaks. It
   does not echo the text back (`Found pboard owned by SKM...`).
 
+### XmlPacket (`0x39`): images
+
+A copied picture travels as paths, not pixels. The Mac writes the
+pasteboard's TIFF and a 24-bit Windows BMP of it to temp files and sends
+(1 024 bytes for a 900 × 505 image):
+
+```xml
+<CP_Content_Text></CP_Content_Text>
+<CP_Content_Bitmap_ImageFile>…</CP_Content_Bitmap_ImageFile>  <!-- …/-Tmp-/CBBitmapContent.tmp, BMP -->
+<CP_Content_ImageFile>…</CP_Content_ImageFile>                <!-- …/-Tmp-/CBContent.tmp, the TIFF -->
+<CB_Format_Type>Apple TIFF Format</CB_Format_Type>
+```
+
+inside the same `Param_Clipboard_Info_2` wrapper as text. Each path is
+uppercase hex of UTF-16LE plus NUL, in the Mac's `/\var\folders\…` form.
+The receiver fetches the files itself with `0x10`, using the POSIX path
+(`/var/folders/…`). Fetched from Linux, both matched the Mac's temp files
+byte for byte, and `CBContent.tmp` matched the copied TIFF.
+
+Receiving (KMClipboard's `COSXClipboardAppleBaseConverter`), the Mac:
+
+1. reads `CP_Content_ImageFile` and downloads it at once (`Enter
+   handleDownloadClipboardFile`, a normal `0x10` session) into its temp folder;
+2. puts the bytes on the pasteboard as the format's type (`Apple TIFF Format`
+   → `NSTIFFPboardType`);
+3. if `CP_Content_Bitmap_ImageFile` is present, downloads it too, opens it
+   with `NSImage` (any format it reads) and adds its `TIFFRepresentation`.
+
+An empty `CP_Content_Bitmap_ImageFile` element crashed GoBridgeDemon
+(`ConvertHexStringToPath` on an empty string, `EXC_BAD_ACCESS` in
+`+[StringUtil stringWithLittleEndianUnicodeData:]`). Without the element the
+Mac skips step 3. Other receive converters in KMClipboard, not tried:
+`CB_Format_DIB` (also lands as TIFF), `CB_Format_MutipleImages`,
+`CB_Format_RTF`, `CB_Format_PPT_ActiveClipboard`, and the Apple PDF, PICT,
+RTF, RTFD and HTML formats.
+
 ### DownloadMultipleFile (`0x10`): file contents
 
 From the decompiled `THMGBServer handleDownloadMultipleFile:` and the command
@@ -301,6 +337,27 @@ remaining files nor `0xa7`. Other IDs from the decompile, not seen live:
 (`sessionID u32, count u16, fileIDs`), `0xab` DownloadMultiFileException.
 `0x0b` DownloadFile has a class but is not in `commandClassForCommandID:`, so
 the Mac cannot receive it.
+
+### MultipleFilePackage (`0x3a`): several commands in one
+
+```
+3a <count u32, little-endian> <11 bytes, skipped> <command>*
+```
+
+`MultipleFilePackage initFromData:` reads the count without a byte swap,
+starts at offset 15 of the payload, and for each command reads its ID,
+decodes it with that command's class and steps by its header plus data
+length. `THMFileManager handleMultipleFilePackage:` hands each command to the
+server (ID < `0xa0`) or the client (ID ≥ `0xa0`). The Mac's own `encodeData`
+writes only the header, so the Mac never sends a usable one, but it accepts
+one from a peer. Serving four small files as one `0x3a` holding four `0xa3`,
+the Mac logged `counts=4`, `Exit from MultipleFilePackage:initFromData:`, then
+`Did download 4 files` after the `0xa7`. `upipe_peer.py` bundles runs of
+whole-file `0xa3` pieces (single-piece files next to each other in the
+request) up to 8 MiB per package. A run of one, and pieces of split files,
+stay bare.
+
+### Serving to the Mac
 
 Serving from Linux (`--offer`), little-endian replies in the order above
 were accepted: the Mac logs `Client commandID: A1`, `ResponseResult(0xa1)
@@ -463,12 +520,16 @@ python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --second
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 90 --login linux-peer --offer ./a.bin --offer ./b.bin
 # Share a folder: browse it, copy from it and paste into it from Wormhole.app
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 600 --login linux-peer --share ~/share
+# Put a TIFF on the Mac's clipboard; save every image the Mac copies as RUN/clipboard_<n>.tiff
+python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 30 --login linux-peer --clipboard-image ./pic.tiff
+python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 300 --login linux-peer --save-clipboard-images
 python3 -m unittest tools.test_upipe_peer
 ```
 
 Output: one `pkt_NNNN.bin` per fetched packet and `upipe_peer.jsonl`
 (`state`, `packet`, `command`, `queue`, `sent` records), plus
-`download_<fileID>.bin` per `--download`. With `--download` the tool stops as
+`download_<fileID>.bin` per `--download` and `clipboard_<n>.tiff` per image
+with `--save-clipboard-images`. With `--download` the tool stops as
 soon as `0xa7` or `0xa9` arrives. `--endian big` sends the request
 big-endian; it exists only to reproduce the crash below. `--offer` serves
 only the offered files (anything else gets `0xa9`, code 6), re-reading each
@@ -509,6 +570,9 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `upload…big`, `upload…two` | 20 MiB: three `0x0c` (8, 8, 4 MiB), about 1.3 s from `0x12` to the last piece (~16.5 MB/s). Two files in one paste: one `0x13`/`0x12` pair listing both, the pieces file by file, one `0xa7`. All hashes match |
 | `upload…exists` (same file pasted again) | `0xa8` lists the file's ID; the Mac shows its replace dialog. Don't Replace: no `0x12`, file unchanged. Replace: `0x12`, `0x0c`, file overwritten (hash matches) |
 | `fileops` (`--share`, File menu and in-place rename on the Mac) | Move to Trash on a file: `0x08` (105 bytes, session 0) → result 0, the file lands in the test Trash with its `.trashinfo`. On a folder with one file: `0x04` for it, `0x08` for the file, `0x06` for the folder (session 103). Rename: `0x09` (213 bytes) → result 0, renamed. Rename onto an existing folder: result 1, error code 3; the Mac shows `Fail to rename file …!` and nothing changes. New Folder twice: `0x07` for `untitled folder`, then `untitled folder 2` |
+| `img` (`--login`; a 900 × 505 TIFF set as the Mac's clipboard) | A 1 024-byte XmlPacket, `Apple TIFF Format`, with the two temp paths; the encoder reproduces it byte for byte. `--download` of both paths: the TIFF (1 818 400 bytes) and the BMP (1 363 554), SHA-256 equal to the Mac's files. `--save-clipboard-images` saved the TIFF as `clipboard_1.tiff` (same hash) |
+| `imgpush` (`--clipboard-image`, 200 × 100 TIFF) | First try with an empty Bitmap element: the Mac fetched the file, then GoBridgeDemon crashed (above). Without the element: the Mac fetched it with `0x10` and its clipboard held the 60 140-byte TIFF; read back, 200 × 100 |
+| `pkg` (`--offer`, small files) | Two, then four, small files in one `0x3a`: the Mac logs `counts=2`/`counts=4` and `Did download N files`; all hashes match. With a 20 MiB file between two small ones nothing is bundled, and all three match |
 | `sharedl` (Copy in the remote browser, Paste in Finder) | The Mac sends `0x10` for the shared path; ResponseResult, `0xa3`, `0xa7`; the Mac logs `Did download 1 files`. SHA-256 matches |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
@@ -527,15 +591,15 @@ because they contain the Mac's host name.
 
 - Drag-and-drop: what it needs from the peer (likely the mouse/KM side; the
   Mac abandoned the drag).
-- The `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`) and when the
-  Mac uses it; other `0xa9` error codes.
+- Other `0xa9` error codes.
 - `0x37` ChangeFileAttribute: the Mac logs `setAttribute: 0` after each
   downloaded file but sent none in the tests.
 - `0x0a` UploadFile, `0x0d`, `0x15` (zero-length upload) and `0xaa`: when
   the Mac uses them.
 - `0xa6` (zero-length file) and `0xa5`/`0xab`: `--offer` sends an empty file
   as one empty `0xa3`, which is not verified live.
-- Image clipboard formats (only text and file seen).
+- The other clipboard formats (`CB_Format_DIB`, `CB_Format_MutipleImages`,
+  RTF, HTML, PDF): expected from Windows peers; only text, file and TIFF seen.
 - `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
 - Windows peer parity: the same commands are expected but not yet captured.

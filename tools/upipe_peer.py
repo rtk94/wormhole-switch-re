@@ -87,6 +87,7 @@ CMD_UPLOAD_CONFIRMATION = 0xA8
 CMD_DIRECTORY_INFO = 0xA2
 CMD_DOWNLOAD_MULTI = 0x10
 CMD_XML = 0x39
+CMD_PACKAGE = 0x3A
 CMD_RESPONSE = 0xA1
 CMD_FILE_DATA = 0xA3
 CMD_DOWNLOAD_FINISHED = 0xA7; CMD_UPLOAD_ERROR = 0xA9
@@ -100,7 +101,8 @@ COMMANDS = {   # -[<Class> init] setCommandID: values (GoBridgeDemon 152311cb)
     0x14: "UploadMultipleFileAbort", 0x15: "UploadMultipleFileZeroLength",
     0x34: "SyncDynamic", 0x35: "DownloadMultipleFileDynamic",
     0x36: "DownloadMultipleFileDynamicExt", 0x37: "ChangeFileAttribute",
-    0x38: "QueryErrorCodeString", 0x39: "XmlPacket", 0xA1: "ResponseResult",
+    0x38: "QueryErrorCodeString", 0x39: "XmlPacket", 0x3A: "MultipleFilePackage",
+    0xA1: "ResponseResult",
     0xA2: "DirectoryInfo", 0xA3: "DownloadFileData", 0xA4: "DriveInfo",
     0xA5: "DownloadFileDataFailed", 0xA6: "ResponseDownloadMultiFileZeroLength",
     0xA7: "DownloadMultiFileFinished", 0xA8: "UploadMultiFileConfirmation",
@@ -387,6 +389,54 @@ def encode_clipboard_files(nodes):
     return encode_xml_packet(CLIPBOARD_XML.format(body=body))
 
 
+IMAGE_FORMAT_TIFF = "Apple TIFF Format"
+
+
+def _hex_path(path):
+    return (path + "\0").encode("utf-16-le").hex().upper() if path else ""
+
+
+def encode_clipboard_image(image_path, bitmap_path=None, fmt=IMAGE_FORMAT_TIFF):
+    """Cmd_Transfer_Clipboard XmlPacket for an image, as the Mac sends a copied
+    picture: no pixels, only paths the receiver fetches with 0x10.
+    CP_Content_ImageFile is the image in fmt (the Mac: the TIFF from the
+    pasteboard); CP_Content_Bitmap_ImageFile, optional, any image NSImage
+    reads (the Mac sends a Windows BMP); the Mac adds its TIFFRepresentation."""
+    # An empty Bitmap element crashes GoBridgeDemon; an absent one is skipped.
+    bitmap = ("<CP_Content_Bitmap_ImageFile>%s</CP_Content_Bitmap_ImageFile>"
+              % _hex_path(bitmap_path) if bitmap_path else "")
+    body = ("<CP_Content_Text></CP_Content_Text>%s"
+            "<CP_Content_ImageFile>%s</CP_Content_ImageFile>"
+            "<CB_Format_Type>%s</CB_Format_Type>"
+            % (bitmap, _hex_path(image_path), fmt))
+    return encode_xml_packet(CLIPBOARD_XML.format(body=body))
+
+
+def posix_path(path):
+    """A Mac clipboard path (/\\var\\folders\\…) as the POSIX path to request."""
+    if path.startswith("/\\"):
+        return "/" + path[2:].replace("\\", "/")
+    return path
+
+
+class ClipboardImageFetcher:
+    """Fetch each image the peer copies (its CP_Content_ImageFile) with 0x10,
+    saving it as clipboard_<n>.tiff.  IDs start at 1001 to stay clear of
+    --download's session 1."""
+
+    def __init__(self, first_id=1001):
+        self.next_id, self.names = first_id, {}
+
+    def request(self, peer_path, endian="<"):
+        fid = self.next_id
+        self.next_id += 1
+        self.names[fid] = "clipboard_%d.tiff" % (len(self.names) + 1)
+        return encode_download_request(fid, [(fid, posix_path(peer_path))], endian)
+
+    def filename(self, file_id):
+        return self.names.get(file_id)
+
+
 def _tag(xml, name):
     start, end = "<%s>" % name, "</%s>" % name
     i = xml.find(start)
@@ -403,6 +453,14 @@ def decode_clipboard(xml):
             out["text"] = bytes.fromhex(content).decode("utf-16le").rstrip("\0")
         except ValueError as e:
             out["text_error"] = str(e)
+    for key, tag in (("image_file", "CP_Content_ImageFile"),
+                     ("bitmap_file", "CP_Content_Bitmap_ImageFile")):
+        content = _tag(xml, tag)
+        if content:
+            try:
+                out[key] = bytes.fromhex(content).decode("utf-16le").rstrip("\0")
+            except ValueError as e:
+                out[key + "_error"] = str(e)
     if "<NodeInfo>" in xml:
         out["files"] = xml.count("<NodeInfo>")
         nodes, pos = [], 0
@@ -484,14 +542,75 @@ MAX_FILE_PIECE = 0x800000           # the Mac sends at most 8 MiB per 0xA3
 READ_FILE_ERROR = 6                 # "Read file data error", as the Mac reports a missing file
 
 
-def serve_download(cmd, offered, endian="<", piece=MAX_FILE_PIECE, request_endian=">"):
+PACKAGE_RESERVED = 11      # bytes the Mac skips between the count and the commands
+
+
+def encode_multiple_file_package(commands):
+    """MultipleFilePackage (0x3a): 3a <count u32> <11 bytes> <commands>.
+    MultipleFilePackage initFromData: reads the count without a byte swap
+    (little-endian on the Mac), starts at offset 15 and steps by each
+    command's header plus data length; THMFileManager hands every command
+    to the server (< 0xa0) or client (>= 0xa0).  The Mac's encodeData writes
+    no commands, so only a peer sends a usable one."""
+    return (bytes([CMD_PACKAGE]) + struct.pack("<I", len(commands)) + bytes(PACKAGE_RESERVED)
+            + b"".join(commands))
+
+
+def decode_multiple_file_package(cmd, endian="<"):
+    """The file-data commands (0xa3, 0x0c) inside a MultipleFilePackage."""
+    if len(cmd) < 5 + PACKAGE_RESERVED or cmd[0] != CMD_PACKAGE:
+        raise ValueError("not a MultipleFilePackage")
+    (count,) = struct.unpack("<I", cmd[1:5])
+    off, out = 5 + PACKAGE_RESERVED, []
+    for _ in range(count):
+        if off + FILE_DATA_HEADER > len(cmd) or cmd[off] not in (CMD_FILE_DATA,
+                                                                  CMD_UPLOAD_FILE_DATA):
+            raise ValueError("MultipleFilePackage command %d truncated or not file data"
+                             % len(out))
+        (length,) = struct.unpack(endian + "I", cmd[off + 13:off + 17])
+        end = off + FILE_DATA_HEADER + length
+        if end > len(cmd):
+            raise ValueError("MultipleFilePackage command %d truncated" % len(out))
+        out.append(cmd[off:end])
+        off = end
+    return out
+
+
+def package_file_data(replies, limit=MAX_FILE_PIECE):
+    """Bundle runs of whole-file 0xa3 replies (totalCount 1) into 0x3a
+    packages of at most limit data bytes; a run of one stays bare."""
+    out, run, size = [], [], 0
+
+    def flush():
+        out.extend([encode_multiple_file_package(run)] if len(run) > 1 else run)
+
+    for r in replies:
+        whole = r[0] == CMD_FILE_DATA and struct.unpack("<I", r[5:9])[0] == 1
+        n = len(r) - FILE_DATA_HEADER
+        if whole and run and size + n <= limit:
+            run.append(r)
+            size += n
+            continue
+        flush()
+        run, size = ([r], n) if whole else ([], 0)
+        if not whole:
+            out.append(r)
+    flush()
+    return out
+
+
+def serve_download(cmd, offered, endian="<", piece=MAX_FILE_PIECE, request_endian=">",
+                   package=True):
     """Answer a peer's DownloadMultipleFile the way THMGBServer does.
 
     offered maps the peer-side path we put on its clipboard to the local
     file; nothing else is served.  Replies: ResponseResult, then 0xA3
     pieces per file and 0xA7, or 0xA9 at the first file that cannot be
-    read (the Mac then sends nothing more for the request).
+    read (the Mac then sends nothing more for the request).  With package,
+    small whole files travel together in MultipleFilePackage (0x3a).
     """
+    finish = (lambda r: package_file_data(r, piece)) if package and endian == "<" \
+        else (lambda r: r)
     req = decode_download_request(cmd, request_endian)
     multi = req["multi_session_id"]
     out = [encode_response(CMD_DOWNLOAD_MULTI, 0, session_id=multi, endian=endian)]
@@ -505,13 +624,13 @@ def serve_download(cmd, offered, endian="<", piece=MAX_FILE_PIECE, request_endia
         except OSError:
             out.append(encode_upload_error(multi, READ_FILE_ERROR, f["file_id"],
                                            "Read file data error", endian))
-            return out
+            return finish(out)
         total = max(1, -(-len(data) // piece))
         for i in range(total):
             out.append(encode_file_data(f["file_id"], total, i + 1,
                                         data[i * piece:(i + 1) * piece], endian))
     out.append(encode_download_finished(multi, endian))
-    return out
+    return finish(out)
 
 
 def decode_file_data(cmd, endian=">"):
@@ -572,6 +691,10 @@ def describe_command(cmd, endian=">"):
             out["path"] = decode_get_directory_info(cmd, endian)
         elif cmd[0] == CMD_MAKE_NEW_DIRECTORY:
             out.update(decode_make_new_directory(cmd, endian))
+        elif cmd[0] == CMD_PACKAGE:
+            subs = decode_multiple_file_package(cmd, endian)
+            out["count"] = len(subs)
+            out["commands"] = [describe_command(c, endian) for c in subs]
         elif cmd[0] in (CMD_DELETE_FILE, CMD_DELETE_DIRECTORY):
             out.update(decode_delete(cmd, endian))
         elif cmd[0] == CMD_RENAME_FILE:
@@ -597,7 +720,8 @@ def describe_command(cmd, endian=">"):
     return out
 
 
-def after_login_commands(clipboard=None, offer=None, download=None, endian="<", share=None):
+def after_login_commands(clipboard=None, offer=None, download=None, endian="<", share=None,
+                         image=None):
     """Commands to queue once the peer accepts our Login, as (command, why)."""
     out = []
     if share:
@@ -611,6 +735,8 @@ def after_login_commands(clipboard=None, offer=None, download=None, endian="<", 
         out.append((encode_clipboard_text(clipboard), "clipboard"))
     if offer:
         out.append((encode_clipboard_files([node_info_for_file(p) for p in offer]), "offer"))
+    if image:
+        out.append((encode_clipboard_image(os.path.abspath(image)), "image"))
     if download:
         out.append((encode_download_request(1, list(enumerate(download, start=1)), endian),
                     "download"))
@@ -1123,6 +1249,12 @@ def main(argv):
                     help="OS type to announce with --login (default linux)")
     ap.add_argument("--clipboard", metavar="TEXT",
                     help="with --login: push TEXT to the peer's clipboard once logged in")
+    ap.add_argument("--clipboard-image", metavar="TIFF",
+                    help="with --login: put this TIFF image on the peer's clipboard "
+                         "(Apple TIFF Format) and serve it when the peer fetches it")
+    ap.add_argument("--save-clipboard-images", action="store_true",
+                    help="with --login: fetch every image the peer copies to its "
+                         "clipboard; saved as clipboard_<n>.tiff in --out")
     ap.add_argument("--offer", metavar="LOCAL_PATH", action="append",
                     help="with --login: put this local file on the peer's clipboard "
                          "(CB_Format_File, repeatable) and serve it when the peer pastes "
@@ -1141,9 +1273,10 @@ def main(argv):
                     help="byte order for --download fields (default little: the Mac decodes "
                          "a Linux peer little-endian; big crashed its daemon)")
     args = ap.parse_args(argv)
-    if (args.clipboard is not None or args.download or args.offer or args.share) \
-            and not args.login:
-        ap.error("--clipboard, --offer, --share and --download need --login")
+    if (args.clipboard is not None or args.download or args.offer or args.share
+            or args.clipboard_image or args.save_clipboard_images) and not args.login:
+        ap.error("--clipboard, --clipboard-image, --save-clipboard-images, --offer, --share "
+                 "and --download need --login")
     os_byte = {v: k for k, v in OS_NAMES.items()}[args.os]
 
     os.makedirs(args.out, exist_ok=True)
@@ -1161,8 +1294,10 @@ def main(argv):
     relogin = False                     # set by a Logout from the peer
     endian = ">" if args.endian == "big" else "<"
     started = set()                     # file IDs whose download file we have opened
+    images = ClipboardImageFetcher()
     # Paths as the peer will ask for them -> local files; only these are served.
-    offered = {os.path.abspath(p): os.path.abspath(p) for p in args.offer or []}
+    offered = {os.path.abspath(p): os.path.abspath(p)
+               for p in (args.offer or []) + ([args.clipboard_image] if args.clipboard_image else [])}
     shares = [os.path.abspath(d) for d in args.share or []]
     resolver = FileResolver(offered, shares)
     uploads = UploadReceiver(shares)
@@ -1239,11 +1374,15 @@ def main(argv):
                     if cmd[:2] == bytes([CMD_RESPONSE, CMD_LOGIN]) and not after_login_sent:
                         after_login_sent = True
                         for c, why in after_login_commands(args.clipboard, args.offer,
-                                                           args.download, endian, shares):
+                                                           args.download, endian, shares,
+                                                           args.clipboard_image):
                             queue(c, why)
+                    if args.save_clipboard_images and desc.get("image_file"):
+                        queue(images.request(desc["image_file"]), "fetch-image")
                     if cmd[:1] == bytes([CMD_FILE_DATA]) and "decode_error" not in desc:
                         piece = decode_file_data(cmd)
-                        path = os.path.join(args.out, "download_%d.bin" % piece["file_id"])
+                        path = os.path.join(args.out, images.filename(piece["file_id"])
+                                            or "download_%d.bin" % piece["file_id"])
                         # currentIndex starts at 1; truncate on the first piece seen.
                         with open(path, "ab" if piece["file_id"] in started else "wb") as f:
                             f.write(piece["data"])
