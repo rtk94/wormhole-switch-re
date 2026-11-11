@@ -804,7 +804,9 @@ def pair_hid_reports_to_sends(
     end's device.  Scoping by VID:PID per capture keeps other bus
     devices' reports (input receivers, etc.) -- and another host's
     device that happens to reuse a peer bus:dev number -- out of the
-    pairing.
+    pairing, but only for a capture that enumerated the cable.  The
+    traffic fallback cannot tell devices apart: in a capture without
+    enumeration, any device whose EP3/EP4 reports decode is analysed.
 
     Returns a JSON-serialisable dict: counts plus pairs (report + the
     send frame and gap), orphans (reports with no matching send) and
@@ -1163,6 +1165,11 @@ def _fmt_hid_section(hid_reports: list[dict], limit: int = 20) -> list[str]:
     return lines
 
 
+def _dev_label(capture_id: str, bus: int, dev: int) -> str:
+    """'main 3:15' -- frame numbers and bus:dev are per capture."""
+    return "%s %d:%d" % (capture_id, bus, dev)
+
+
 def _fmt_pairing(pairing: dict) -> list[str]:
     lines = ["HID reports vs accepted 0xD9 sends (devices %s):"
              % (", ".join(pairing["device_keys"]) or "none")]
@@ -1184,23 +1191,25 @@ def _fmt_pairing(pairing: dict) -> list[str]:
                          " inferred, not verified.")
     for p in pairing["pairs"]:
         r = p["report"]
-        lines.append("  PAIRED  report f%-5d %d:%d EP%d %s hex=%s"
-                     " <- send f%d %d:%d payload=%s gap=%+.3fs" % (
-                         r["frame"], r["bus"], r["dev"], r["ep_num"],
-                         r["kind"], r["hex"], p["send_frame"],
-                         p["send_bus"], p["send_dev"],
-                         p["send_payload_hex"], p["gap_s"]))
+        lines.append("  PAIRED  report %s f%-5d EP%d %s hex=%s"
+                     " <- send %s f%d payload=%s gap=%+.3fs" % (
+                         _dev_label(r["capture_id"], r["bus"], r["dev"]),
+                         r["frame"], r["ep_num"], r["kind"], r["hex"],
+                         _dev_label(p["send_capture"], p["send_bus"],
+                                    p["send_dev"]),
+                         p["send_frame"], p["send_payload_hex"],
+                         p["gap_s"]))
     for r in pairing["orphans"]:
-        lines.append("  ORPHAN  report f%-5d %d:%d EP%d %s hex=%s -- no"
+        lines.append("  ORPHAN  report %s f%-5d EP%d %s hex=%s -- no"
                      " matching accepted 0xD9 send in the analysed packets"
                      % (
-                         r["frame"], r["bus"], r["dev"], r["ep_num"],
-                         r["kind"], r["hex"]))
+                         _dev_label(r["capture_id"], r["bus"], r["dev"]),
+                         r["frame"], r["ep_num"], r["kind"], r["hex"]))
     for s in pairing["unpaired_sends"]:
-        lines.append("  UNPAIRED send  f%-5d %d:%d %s payload=%s -- not"
+        lines.append("  UNPAIRED send  %s f%-5d %s payload=%s -- not"
                      " consumed by any report in the analysed packets" % (
-                         s["frame"], s["bus"], s["dev"], s["hid_type"],
-                         s["payload_hex"]))
+                         _dev_label(s["capture_id"], s["bus"], s["dev"]),
+                         s["frame"], s["hid_type"], s["payload_hex"]))
     return lines
 
 
