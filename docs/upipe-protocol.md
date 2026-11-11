@@ -153,8 +153,20 @@ A Windows peer (OS `0x07`) writes its fields little-endian too: XmlPacket
 lengths, GetDirectoryInfo path lengths, session IDs and the commands inside a
 MultipleFilePackage (#50). `tools/wormhole_parse.py` takes each direction's
 byte order from that direction's Login (big-endian for `mac`, little-endian
-otherwise), and `describe_command` retries in the other order when a command
-does not decode.
+otherwise). In a capture started after the Login, the first command that
+decodes in only one byte order sets it. `describe_command` retries in the
+other order when a command does not decode, and `0xa3`'s data length must
+match exactly, so a piece read in the wrong order fails instead of
+decoding as a garbage file ID.
+
+The Mac writes its numbers big-endian to a Windows peer too, but its UTF-16
+strings follow the remote: paths it echoes back to Windows (the source paths
+in `0x10`) are UTF-16LE, its own (the destinations) UTF-16BE. The decoders
+pick each string's order from where its zero bytes fall.
+
+A Windows peer also sends a 100-byte all-zero command (ID `0x00`, dummy)
+after each command it sends, as a real chunk (`seq` non-zero), on top of the
+all-zero terminator chunk. The Mac sends none.
 
 IDs known to `CommandDataBuffer commandClassForCommandID:`: `0x00` (dummy),
 `0x01`, `0x02`, `0x04`, `0x06`–`0x09`, `0x0c`, `0x0e`, `0x10`–`0x15`, `0x37`,
@@ -209,20 +221,21 @@ sends little-endian ([Layer 4](#layer-4-commands)). Paths are UTF-16.
 | `handleDeleteFile:` | `0x08` | `<session u32> <len u16> <path>` | `0xa1` 0/1 | live |
 | `handleRenameFile:` | `0x09` | `<session u32> <oldLen u16> <newLen u16> <old> <new>` | `0xa1`, error code on failure | live |
 | `handleUploadFileData:` | `0x0c` | `<fileID u32> <total u32> <index u32> <len u32> <data>` | `0xa7` when the session completes | live |
-| `handleDownloadMultipleFile:` | `0x10` | `<multi u32> <count u16> {<fileID u32> <len u16> <path>}` | `0xa1`, `0xa3`…, `0xa7` or `0xa9` | live, both ways |
-| `handleDownloadMultipleFileAbort:` | `0x11` | not decoded | — | not observed |
+| (`DownloadFileAbort`) | `0x0f` | `<fileID u32> <u32 0>` | none seen | live, Mac → Windows: cancelling a copy, one after each further `0xa3` piece; Windows stopped after six (piece 19 of 26) |
+| `handleDownloadMultipleFile:` | `0x10` | `<multi u32> <count u16> {<fileID u32> <len u16> <path>}`; from the Mac to Windows each file adds `<destLen u16> <dest>` | `0xa1`, `0xa3`…, `0xa7` or `0xa9` | live, both ways |
+| `handleDownloadMultipleFileAbort:` | `0x11` | `<multi u32> <u32 0>` | none seen | live, Mac → Windows, once, before the `0x0f`s |
 | `handleUploadMultipleFile:` | `0x12` | `<multi u32> <count u16> {<fileID u32> <len u16> <path>}` | only on error | live |
 | `handleUploadMutipleFilesConfirm:` | `0x13` | `<multi u32> <size u64> <large u16> <count u16> {…}` | `0xa8` | live |
 | `handleUploadMultipleFileAbort:` | `0x14` | `<multi u32>` | none | from the decompile, not observed |
 | `handleUploadMultipleFilesWithZeroLength:` | `0x15` | as `0x12` | `0xa9` code 3 on failure only | live |
-| `handleChangeFileAttribute:` | `0x37` | `<attributes u32> <ctime u64> <atime u64> <mtime u64> <len u32> <path>`; times are FILETIME | none seen | live, Windows → Mac, inside `0x3a` after each `0xa3` |
+| `handleChangeFileAttribute:` | `0x37` | `<attributes u32> <ctime u64> <atime u64> <mtime u64> <len u32> <path>`; times are FILETIME | none seen | live, both ways: Windows → Mac after each file it serves (inside `0x3a`, or bare after a split or empty file), with the Mac's destination path; Mac → Windows bare after each file, attributes 0, empty path |
 | `handleExtraXMLPacket:` | `0x39` | `<xmlLen u32> <xml>` | none | live, both ways (clipboard, drive list) |
 | (`THMFileManager handleMultipleFilePackage:`) | `0x3a` | `<count u32 LE> <11 bytes> <commands>` | per command | live, Linux and Windows → Mac |
 | `handleRequestResponse:` | `0xa1` | see [ResponseResult](#responseresult-0xa1) | — | live |
 | `handleDirectoryInfo:` | `0xa2` | `<count u16> <552-byte records> <free u64> <pad>` | — | live |
 | `handleDownloadFileData:` | `0xa3` | as `0x0c` | — | live, both ways |
 | `handleDriveInfo:` | `0xa4` | see [DomainFolders and DriveInfo](#domainfolders-0xad-and-driveinfo-0xa4) | none | live, Mac ↔ Windows (a Linux peer uses the XML drive list) |
-| `handleDownloadFileZero:` | `0xa6` | `<session u32> <count u16> <fileIDs>` | — | not observed: the Mac sends an empty file as one empty `0xa3` |
+| `handleDownloadFileZero:` | `0xa6` | `<multi u32> <count u16> <fileID u32>…` | — | live, Windows → Mac, for an empty file, before the `0xa1`; the Mac sends an empty file as one empty `0xa3` |
 | `handleUploadDownloadFinish:` | `0xa7` | `<session u32>` | — | live, both ways |
 | `handleUploadMultipleFileConfirmation` | `0xa8` | `<4 flags> <session u32> <existCount u32> <IDs>` | — | live |
 | `handleUploadMultiFileError` | `0xa9` | `<session u32> <code u32> <fileID u32> <tag 6> <len u32> <string>` | — | live, both ways |
@@ -402,7 +415,10 @@ Request, requester → server:
 ```
 
 A non-Linux sender appends `<destLen u16> <dest>` per file; the Mac decodes
-it only when the remote is a Mac. Requesting from a Linux peer, the Mac sends
+it only when the remote is a Mac. The Mac sends it to a Windows peer: each
+file's Windows source path (UTF-16LE), then the Mac's destination path
+(UTF-16BE, the target folder plus the name), both NUL-terminated. Windows
+does not send one to the Mac. Requesting from a Linux peer, the Mac sends
 no destination, ends each path with a UTF-16 NUL (counted in `pathLen`), and
 numbers the files from `multiSessionID` up (session 104: file IDs 104 and
 105). Its session IDs counted 101, 102, … across requests in one daemon run.
@@ -417,12 +433,22 @@ Replies, server → requester, in order:
 | `0xa9` | UploadMultiFileError (instead of `0xa3`/`0xa7` when a file is missing) | `a9 <sessionID u32> <errorCode u32> <errorFileID u32> <tag 6 B> <errorStringLength u32> <errorString UTF-16BE, NUL-terminated>`; seen: code 6, `Read file data error`, tag all zero |
 
 `fileID` in `0xa3` is the requester's `fileID`. After the last piece of each
-file the Mac logs `setAttribute: 0` (`ChangeFileAttribute`); it sent no
-separate packet for it in the test. A missing file ends the whole request:
+file the Mac logs `setAttribute: 0` (`ChangeFileAttribute`). To a Linux peer
+it sent no packet for it; to a Windows peer it sends a bare 33-byte `0x37`
+(attributes 0, big-endian FILETIMEs, empty path) between the last `0xa3`
+and `0xa7`. A missing file ends the whole request:
 the Mac logs `<path> does not exist!!!`, sends `0xa9`, and sends neither the
-remaining files nor `0xa7`. Other IDs from the decompile, not seen live:
-`0xa5` DownloadFileDataFailed, `0xa6` ResponseDownloadMultiFileZeroLength
-(`sessionID u32, count u16, fileIDs`), `0xab` DownloadMultiFileException.
+remaining files nor `0xa7`. `0xa6` ResponseDownloadMultiFileZeroLength
+(`multiSessionID u32, count u16, fileIDs u32`) is how Windows answers for
+empty files ([package](#multiplefilepackage-0x3a-several-commands-in-one)).
+Not seen live: `0xa5` DownloadFileDataFailed, `0xab`
+DownloadMultiFileException.
+
+Cancelling (Windows → Mac copy of a 200 MiB file, cancelled on the Mac
+at piece 13 of 26): the Mac sent `0x11`
+DownloadMultipleFileAbort (`<multiSessionID u32> <u32 0>`), then one `0x0f`
+DownloadFileAbort (`<fileID u32> <u32 0>`) after each further piece. Windows
+sent no reply and stopped after piece 19; no `0xa7` followed.
 `0x0b` DownloadFile has a class but is not in `commandClassForCommandID:`, so
 the Mac cannot receive it.
 
@@ -487,6 +513,13 @@ it sent one `0x3a` with count 2, the `0xa3` (whole file, little-endian)
 followed by a `0x37` ChangeFileAttribute (attributes `0x20`, three FILETIMEs,
 the Mac's destination path). Its 11 reserved bytes held stale buffer contents
 (part of an earlier XmlPacket), not zeros, so they are ignored.
+
+In the deliberate session (#50) Windows packaged every run of whole small
+files, up to six commands (three `0xa3` and their `0x37`) in one `0x3a`.
+A file split into 8 MiB pieces went bare, followed by a bare `0x37`. An
+empty file got neither: Windows answered with `0xa6` (`<multi u32>
+<count u16> <fileID u32>…`) and a bare `0x37`, before its ResponseResult
+for the request, then served the rest.
 
 ### Serving to the Mac
 
@@ -638,6 +671,28 @@ sends the same `0x10` request as a clipboard paste, for the shared path
 (session 106, file ID 107: here the file ID did not equal the session ID).
 The replies are those of [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents).
 
+### Windows ↔ Mac session (#50)
+
+A guided session (`tools/windows_capture.ps1`, 22 steps) with the Windows
+GoBridge in a KVM guest and Wormhole.app on the Mac; markers per step,
+usbmon on the host. Every command decodes (222 commands, no errors).
+
+| Step | Wire | Result |
+|---|---|---|
+| Copy text, Unicode text on Windows | `0x39` `CB_Format_UnicodeText` (hex UTF-16LE in `CP_Content`) | Pasted on the Mac |
+| Copy RTF, HTML, an image on Windows | `0x39` `CB_Format_RTF` / `HTML Format` / `CB_Format_DIB` naming a temp file; the Mac fetches it (`0x10` → `0xa1`, `0x3a`, `0xa7`), then sends `0x39` `Cmd_Delete_Src_Temp_File` | Pasted on the Mac |
+| Copy one file, four files (one empty, one 20 MiB), three images | `0x39` `CB_Format_File`; paste on the Mac → one `0x10` with destinations; replies as in [package](#multiplefilepackage-0x3a-several-commands-in-one) | All byte-identical on the Mac |
+| Copy a folder (three levels) | The Mac walks it: `0x04` per folder → `0xa1`, `0xa2`; one `0x10` per file. Windows also sent `0xad` and `0xa4` after the first listing | Tree identical on the Mac |
+| Copy text, RTF, an image on the Mac | `CB_Format_Text`; `Apple RTF Format` and `Apple TIFF Format` naming temp files, which Windows fetches with `0x10` (`//var/…` paths); the Mac serves `0xa1`, `0xa3`, `0x37`, `0xa7`; Windows sends `Cmd_Delete_Src_Temp_File` | On Windows' clipboard, all 55 characters of the text; the RTF as `Rich Text Format` plus text, the image as a bitmap. Each also carries a private `_O_KM_OwnerShip_` format |
+| Copy files on the Mac, paste in Explorer | `0x39` `CB_Format_File` only; Windows sent no `0x10` | Nothing pasted (twice, also in the abort step) |
+| Copy a folder on the Mac, paste in Explorer | Windows walks it with `0x04` (`//Users/…/` paths) and fetches each file with `0x10` | Tree arrived |
+| Cancel a 200 MiB copy | `0x11`, then `0x0f`s (see [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents)) | Cancelled |
+| Remote browser, drag and drop, keyboard and mouse | No UPipe traffic | Not exercised: no remote browser found in the Windows UI; drag and drop did nothing either way; the VM's window kept the host's pointer |
+
+Outside UPipe, Windows sent four HID `d9 36` frames (payload `01`, `01`,
+`00`, `00`) during the folder paste; see [`transport.md`](transport.md).
+Paths, file names and clipboard text in the raw capture stay private.
+
 ## Linux peer: `tools/upipe_peer.py`
 
 Stdlib only (SG_IO via ctypes). `/dev/sgN` must be the cable's generic node
@@ -713,6 +768,7 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `empty` (empty files) | `--download` of an empty Mac file: `0xa1`, one empty `0xa3`, `0xa7` (no `0xa6`). Pasting an empty file into a share: `0x07`, `0x13` (size 0), `0x15`; before the fix the tool ignored `0x15` and the file was silently missing, with no error on the Mac. After the fix the file is created. A mixed paste (empty plus 100 kB) sends `0x13` listing both, `0x15` for the empty one, `0x12` and `0x0c` for the other; both arrive and the hash matches |
 | `sharedl` (Copy in the remote browser, Paste in Finder) | The Mac sends `0x10` for the shared path; ResponseResult, `0xa3`, `0xa7`; the Mac logs `Did download 1 files`. SHA-256 matches |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
+| `win-session` (Windows 11 guest ↔ Mac, guided script) | See [Windows ↔ Mac session](#windows--mac-session-50). Every Windows → Mac file arrived byte-identical (checked on the Mac); the cancelled 200 MiB file did not |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
 `tools/filter_usbmon.py` (19 830 records, sha256 `11b0da0e…`), shows
@@ -732,17 +788,23 @@ Mac-side items are tracked in #51; the Windows formats and parity in #50.
 - Drag-and-drop: what it needs from the peer (likely the mouse/KM side; the
   Mac abandoned the drag).
 - Other `0xa9` error codes.
-- `0x37` ChangeFileAttribute: decoded from a Windows peer (inside `0x3a`);
-  the Mac logs `setAttribute: 0` after each downloaded file but has not sent
-  one.
-- `0x0a` UploadFile, `0x0d`, `0xaa`, `0xa5`, `0xa6`, `0xab`: when the Mac
-  uses them.
-- The aborts (`0x11`, `0x14`): cancel a transfer mid-way to capture them.
-- The other clipboard formats (`CB_Format_DIB`, `CB_Format_MutipleImages`,
-  RTF, PDF): expected from Windows peers; text, file, TIFF and (from Windows)
-  `HTML Format` seen.
+- `0x37` ChangeFileAttribute: what the Mac's empty-path, zero-attribute
+  form means to Windows, and why the Mac sends none to Linux.
+- `0x0a` UploadFile, `0x0d`, `0xaa`, `0xa5`, `0xab`: when they are used.
+- The upload abort (`0x14`) and the Mac's answer to an abort from the
+  serving side; `0x11`/`0x0f` are captured (Mac → Windows) and nothing
+  answered them.
+- Mac → Windows file paste: Windows received the `CB_Format_File`
+  XmlPacket but sent no `0x10`, and nothing was pasted (a folder works).
+  Whether Explorer's paste needs something the VM lacks, or files must be
+  pasted another way.
+- The remaining clipboard formats (`CB_Format_MutipleImages`, PDF); text,
+  Unicode text, RTF, HTML, DIB, file, folder (Windows) and text, Apple RTF,
+  Apple TIFF, file (Mac) are seen.
+- The four `d9 36` frames from Windows ([`transport.md`](transport.md)).
+- Keyboard and mouse sharing, the remote browser and drag and drop with a
+  Windows peer: not exercised yet (the VM window keeps the pointer).
 - What the Mac does with a Windows peer's DomainFolders (Finder sidebar
   entries?) and the misc-info file it points to.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
 - The Windows-only CDBs above (`0xE1`, `d8 00 05`, `d8 01 04`, `d9 3a`).
-- Windows peer parity: the deliberate capture in #50.

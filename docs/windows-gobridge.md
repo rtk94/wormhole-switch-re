@@ -95,5 +95,10 @@ with Wormhole.app on the Mac: same UPipe framing (`0xD8` poll,
 `0xD9 0x28`/`0x2A`), a Windows `Login` (`os_type` windows), folder
 browsing, clipboard `XmlPacket`s and a clipboard-file download.  It also
 shows CDBs the Mac never sent (`0xF0`, `0xE1`, `0xD8` with data out,
-`0xD9 0x3A`) and Windows packets the parser does not decode yet.
-Findings are tracked in #50.
+`0xD9 0x3A`).  Findings are tracked in #50.
+
+The deliberate session that followed (`tools/windows_capture.ps1`) is
+written up in [`upipe-protocol.md`](upipe-protocol.md) § Windows ↔ Mac
+session: clipboard text, RTF, HTML and images, files and folders work both
+ways except a Mac → Windows file paste, and cancelling a copy shows the
+abort commands.

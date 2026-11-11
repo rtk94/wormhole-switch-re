@@ -1106,7 +1106,8 @@ def reassemble_upipe(txns: list[Transaction]) -> list[dict]:
     send the cable rejected is retried by the sender.  Each completed
     command is decoded with upipe_peer.describe_command, in the byte order
     its sender's Login announces (big-endian for the Mac, little-endian
-    for Windows and Linux; big-endian until a Login is seen).
+    for Windows and Linux).  Without a Login, the first command that
+    decodes in only one byte order sets it; big-endian until then.
     """
     state: dict[tuple, tuple[upipe.Reassembler, dict]] = {}
     endian: dict[tuple, str] = {}   # sender byte order, from its Login
@@ -1130,6 +1131,12 @@ def reassemble_upipe(txns: list[Transaction]) -> list[dict]:
         if cmd is None:
             continue
         cmd_frames = frames.pop(chunk["session"])
+        if key not in endian:
+            # No Login yet (capture started mid-session): the first command
+            # that decodes in only one byte order sets the sender's.
+            be, le = upipe.decodes_in(cmd, ">"), upipe.decodes_in(cmd, "<")
+            if be != le:
+                endian[key] = ">" if be else "<"
         fields = upipe.describe_command(cmd, endian.get(key, ">"))
         if fields.get("command") == upipe.CMD_LOGIN and "os_type" in fields:
             # The Mac writes big-endian; Windows and Linux little-endian.
