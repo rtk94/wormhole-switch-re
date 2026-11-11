@@ -56,6 +56,7 @@ See [`docs/capture-log.md`](docs/capture-log.md) for a sample usbmon capture and
 │   ├── iso-payload.md            # ISO contents, manifests, macOS bundle map
 │   ├── pe-analysis.md            # REA PE imports/resources/certs for SKLoader.exe + embedded DLL
 │   ├── mac-gobridge.md           # GoBridgeDemon + OTiTransfer function-level analysis (HID CDB packets)
+│   ├── windows-gobridge.md       # Windows install footprint, recovered binaries and their roles (#48)
 │   ├── capture-log.md            # usbmon methodology + CBW/CSW pattern
 │   ├── capacity-anomaly.md       # why Linux reports 15.5 MiB for a 3.1 MiB volume (#13)
 │   ├── live-capture-2026-11-06.md # live peer-active capture: injection results, sanitisation

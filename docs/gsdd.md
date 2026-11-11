@@ -209,8 +209,13 @@ algorithm cannot even be identified until the cipher is recovered
 
 ### What remains to extract `Wormhole.exe` / `LinkEngKM.exe`
 
-Route 3 is being taken in a Windows KVM guest with the cable passed through
-(`docs/reproduction.md` §6.6), tracked in #48.
+**Resolved (#48, 2026-11-11):** running `SKLoader.exe` in a Windows KVM
+guest with the cable passed through (`docs/reproduction.md` §6.6) unpacked
+every record to `%APPDATA%\KaiJet\Wormhole1107\ExImg\ImageRoot\`, each
+matching its `OS` size above.  Hashes and the install layout are in
+[`windows-gobridge.md`](windows-gobridge.md).  `OTiEncrypt.dll` did not turn
+up after the install, so the cipher itself is still unreversed; the routes
+below remain for doing it without Windows.
 
 1. Obtain `OTiEncrypt.dll` (from a live Wormhole install / vendor media) and reuse
    its exported `DecryptBuffer` via Wine/Frida on the extracted record buffers,
