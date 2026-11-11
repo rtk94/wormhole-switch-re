@@ -167,7 +167,8 @@ through the *keyboard* path (`'4'`, usage at payload byte 2) instead, so
 they replay on peer EP4.
 
 What is **not** known is the 12-byte wire payload for `'6'`: none of the
-committed captures contains a `'6'` frame (no `d9 36` in any pcap), and
+committed captures contains a `'6'` frame from a real key (the only `d9 36`
+in them is our all-zero probe), and
 the decompilation records only the call signature above — the byte
 positions of the press/release flag and the usage are unknown until a
 packet is captured, so the parser reports the payload raw (`payload_hex`)
@@ -180,6 +181,13 @@ only (`docs/live-capture-2026-11-06.md`); whether the cable forwards
 HID report descriptor declares a Consumer page `05 0C`), is open. To
 probe cable acceptance without presupposing a layout, send an all-zero
 `'6'` frame per `docs/reproduction.md` §6.5.
+
+The Windows session (#50, raw capture private) has four `'6'` frames from the
+Windows GoBridge, about 20 ms apart, with no key pressed on purpose:
+`d9 36 01 00…00 4f 54` twice, then `d9 36 00 00…00 4f 54` twice, all CSW
+good, no data phase. Payload byte 0 going `01` → `00` looks like a
+press/release pair or a state toggle, not a Consumer usage; what triggered
+it is open.
 
 ### Parser support (`tools/wormhole_parse.py`)
 

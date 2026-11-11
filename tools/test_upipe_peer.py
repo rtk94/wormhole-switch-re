@@ -454,6 +454,75 @@ class TestDomainFoldersDriveInfo(unittest.TestCase):
             u.decode_drive_info(cmd[:-1], ">")
 
 
+class TestWindowsSession(unittest.TestCase):
+    """Commands from the deliberate Windows <-> Mac session (2026-11-11, #50).
+    Hand-built bytes follow the captured layouts; paths are stand-ins."""
+
+    def test_file_data_in_the_wrong_order_is_rejected(self):
+        # The last 4 MiB piece of a Windows 20 MiB send: read big-endian its
+        # length is 3 751 936, shorter than the data, and it used to decode as
+        # file 0x7d000000.  Without a Windows Login the parser tries ">" first.
+        data = b"\x55" * 4208896
+        cmd = bytes([0xA3]) + struct.pack("<IIII", 125, 3, 3, len(data)) + data
+        with self.assertRaises(ValueError):
+            u.decode_file_data(cmd, ">")
+        d = u.describe_command(cmd, ">")
+        self.assertEqual((d["file_id"], d["total"], d["index"]), (125, 3, 3))
+
+    def test_mac_request_to_windows_has_mixed_strings_and_destinations(self):
+        # Mac -> Windows DownloadMultipleFile: numbers big-endian; each file's
+        # source path in Windows' UTF-16LE, then <dst len u16> and the Mac's
+        # destination in UTF-16BE, both NUL-terminated.
+        def entry(fid, src, dst):
+            s = src.encode("utf-16-le") + b"\0\0"
+            d = dst.encode("utf-16-be") + b"\0\0"
+            return struct.pack(">IH", fid, len(s)) + s + struct.pack(">H", len(d)) + d
+        cmd = (bytes([0x10]) + struct.pack(">IH", 115, 2)
+               + entry(122, "C:\\w\\small.txt", "/Users/u/inbox/small.txt")
+               + entry(123, "C:\\w\\empty.bin", "/Users/u/inbox/empty.bin"))
+        d = u.describe_command(cmd, ">")
+        self.assertNotIn("decode_error", d)
+        self.assertEqual(d["multi_session_id"], 115)
+        self.assertEqual(d["files"], [
+            {"file_id": 122, "path": "C:\\w\\small.txt", "destination": "/Users/u/inbox/small.txt"},
+            {"file_id": 123, "path": "C:\\w\\empty.bin", "destination": "/Users/u/inbox/empty.bin"}])
+
+    def test_request_without_destination_unchanged(self):
+        cmd = u.encode_download_request(5, [(7, "/tmp/a.bin")], ">")
+        self.assertEqual(u.decode_download_request(cmd, ">")["files"],
+                         [{"file_id": 7, "path": "/tmp/a.bin"}])
+
+    def test_utf16_order_follows_the_bytes(self):
+        for path in ("C:\\Users\\u\\Desktop", "/Users/u/f" + chr(0xFC) + ".txt"):
+            for enc, endian in (("utf-16-le", ">"), ("utf-16-be", "<")):
+                cmd = (bytes([0x04]) + struct.pack(endian + "H", len(path.encode(enc)))
+                       + path.encode(enc))
+                self.assertEqual(u.describe_command(cmd, endian)["path"], path)
+
+    def test_download_aborts(self):
+        # The Mac cancelling a Windows -> Mac copy: one 0x11 for the session,
+        # 0x0f (six times) for the file; <id u32> <u32 0>, big-endian.
+        d = u.describe_command(bytes.fromhex("110000007800000000"), ">")
+        self.assertEqual((d["command_name"], d["multi_session_id"], d["reserved"]),
+                         ("DownloadMultipleFileAbort", 0x78, 0))
+        d = u.describe_command(bytes.fromhex("0f0000008400000000"), ">")
+        self.assertEqual((d["command_name"], d["file_id"], d["reserved"]),
+                         ("DownloadFileAbort", 0x84, 0))
+
+    def test_zero_length_response(self):
+        # Windows answering a request that includes an empty file:
+        # a6 <multi u32> <count u16> <fileID u32>..., little-endian.
+        d = u.describe_command(bytes.fromhex("a67300000001007b000000"), "<")
+        self.assertNotIn("decode_error", d)
+        self.assertEqual((d["multi_session_id"], d["file_ids"]), (0x73, [0x7B]))
+
+    def test_mac_change_attribute_without_path(self):
+        ft = u.filetime_from_unix(1794434405)
+        cmd = bytes([0x37]) + struct.pack(">IQQQI", 0, ft, ft, ft, 0)
+        d = u.describe_command(cmd, ">")
+        self.assertEqual((d["attributes"], d["mtime"], d["path"]), (0, 1794434405, ""))
+
+
 class TestImageFetcher(unittest.TestCase):
     """--save-clipboard-images: fetch each image the Mac copies."""
 

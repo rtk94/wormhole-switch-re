@@ -380,7 +380,7 @@ def decode_change_file_attribute(cmd, endian="<"):
     raw = cmd[CHANGE_ATTRIBUTE_HEADER:CHANGE_ATTRIBUTE_HEADER + n]
     return {"attributes": attributes, "ctime": unix_from_filetime(ct),
             "atime": unix_from_filetime(at), "mtime": unix_from_filetime(mt),
-            "path": raw.decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")}
+            "path": _decode_utf16(raw, endian).rstrip("\0")}
 
 
 def encode_node_info(path, size, ctime, atime, mtime):
@@ -539,24 +539,47 @@ def encode_download_request(multi_session_id, files, endian="<"):
 def decode_download_request(cmd, endian=">"):
     """DownloadMultipleFile (0x10) in the requester's byte order.
 
-    The Mac sends it big-endian with a NUL-terminated UTF-16BE path and,
-    to a Linux peer, no destination field.  The trailing NUL is stripped.
+    10 <multi u32> <count u16> {<fileID u32> <len u16> <path> [<len u16> <dest>]}
+    To a Linux peer the Mac sends no destination; to a Windows peer each file
+    carries the Mac's destination path (#50), and the source path comes back
+    in Windows' UTF-16LE inside the big-endian command.  The layout that uses
+    the whole command wins; trailing NULs are stripped.
     """
     if len(cmd) < 7 or cmd[0] != CMD_DOWNLOAD_MULTI:
         raise ValueError("not a DownloadMultipleFile")
-    utf16 = "utf-16-be" if endian == ">" else "utf-16-le"
     multi, count = struct.unpack(endian + "IH", cmd[1:7])
-    files, off = [], 7
-    for _ in range(count):
-        if off + 6 > len(cmd):
-            raise ValueError("DownloadMultipleFile truncated")
-        file_id, n = struct.unpack(endian + "IH", cmd[off:off + 6])
-        off += 6
-        if off + n > len(cmd):
-            raise ValueError("DownloadMultipleFile path truncated")
-        path = cmd[off:off + n].decode(utf16).rstrip("\0")
-        off += n
-        files.append({"file_id": file_id, "path": path})
+
+    def walk(with_dest):
+        files, off = [], 7
+        for _ in range(count):
+            if off + 6 > len(cmd):
+                raise ValueError("DownloadMultipleFile truncated")
+            file_id, n = struct.unpack(endian + "IH", cmd[off:off + 6])
+            off += 6
+            if off + n > len(cmd):
+                raise ValueError("DownloadMultipleFile path truncated")
+            f = {"file_id": file_id, "path": _decode_utf16(cmd[off:off + n], endian).rstrip("\0")}
+            off += n
+            if with_dest:
+                if off + 2 > len(cmd):
+                    raise ValueError("DownloadMultipleFile destination truncated")
+                (m,) = struct.unpack(endian + "H", cmd[off:off + 2])
+                if off + 2 + m > len(cmd):
+                    raise ValueError("DownloadMultipleFile destination truncated")
+                f["destination"] = _decode_utf16(cmd[off + 2:off + 2 + m], endian).rstrip("\0")
+                off += 2 + m
+            files.append(f)
+        return files, off
+
+    try:
+        files, off = walk(False)
+        if off == len(cmd):
+            return {"multi_session_id": multi, "files": files}
+    except (ValueError, UnicodeDecodeError):
+        pass
+    files, off = walk(True)
+    if off != len(cmd):
+        raise ValueError("DownloadMultipleFile has %d trailing bytes" % (len(cmd) - off))
     return {"multi_session_id": multi, "files": files}
 
 
@@ -684,9 +707,12 @@ def decode_file_data(cmd, endian=">"):
     if len(cmd) < FILE_DATA_HEADER or cmd[0] != CMD_FILE_DATA:
         raise ValueError("not a DownloadFileData")
     file_id, total, index, length = struct.unpack(endian + "IIII", cmd[1:FILE_DATA_HEADER])
-    data = cmd[FILE_DATA_HEADER:FILE_DATA_HEADER + length]
+    # Exact length: a piece read in the wrong byte order can claim fewer bytes
+    # than it carries (a Windows 4 MiB piece read big-endian), so trailing
+    # bytes are an error too.  Packages slice their pieces exactly.
+    data = cmd[FILE_DATA_HEADER:]
     if len(data) != length:
-        raise ValueError("DownloadFileData truncated: %d of %d bytes" % (len(data), length))
+        raise ValueError("DownloadFileData length %d, %d bytes present" % (length, len(data)))
     return {"file_id": file_id, "total": total, "index": index, "data_length": length,
             "data": data}
 
@@ -706,7 +732,7 @@ def decode_upload_error(cmd, endian=">"):
         raise ValueError("UploadMultiFileError string truncated")
     return {"session_id": session_id, "error_code": code, "file_id": file_id,
             "tag": cmd[13:19].hex(),
-            "error": raw.decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")}
+            "error": _decode_utf16(raw, endian).rstrip("\0")}
 
 
 # ------------------------------------------- DomainFolders (0xad), DriveInfo (0xa4)
@@ -749,7 +775,7 @@ def decode_domain_folders(cmd, endian=">"):
             raise ValueError("DomainFolders entry %d path truncated" % len(folders))
         kind = tag & 0xFFFF
         folders.append({"type": kind, "name": DOMAIN_FOLDER_NAMES.get(kind, "unknown"),
-                        "path": cmd[off + 8:off + 8 + n].decode(_utf16(endian)).rstrip("\0")})
+                        "path": _decode_utf16(cmd[off + 8:off + 8 + n], endian).rstrip("\0")})
         off += 8 + n
     return {"length_field": length, "folders": folders}
 
@@ -794,10 +820,40 @@ def decode_drive_info(cmd, endian=">"):
         (m,) = struct.unpack(endian + "H", cmd[off + 4 + n:off + 6 + n])
         if entry != 6 + n + m or off + entry > len(cmd):
             raise ValueError("DriveInfo entry %d length mismatch" % len(drives))
-        drives.append({"name": cmd[off + 4:off + 4 + n].decode(_utf16(endian)).rstrip("\0"),
-                       "path": cmd[off + 6 + n:off + entry].decode(_utf16(endian)).rstrip("\0")})
+        drives.append({"name": _decode_utf16(cmd[off + 4:off + 4 + n], endian).rstrip("\0"),
+                       "path": _decode_utf16(cmd[off + 6 + n:off + entry], endian).rstrip("\0")})
         off += entry
     return {"drives": drives}
+
+
+# --------------------------------------- aborts and the zero-length reply (#50)
+
+CMD_DOWNLOAD_FILE_ABORT = 0x0F
+CMD_DOWNLOAD_MULTI_ABORT = 0x11
+CMD_ZERO_LENGTH = 0xA6
+
+
+def decode_download_abort(cmd, endian=">"):
+    """DownloadFileAbort (0x0f) / DownloadMultipleFileAbort (0x11): <id u32> <u32>.
+    Cancelling a Windows -> Mac copy of one file, the Mac sent one 0x11 for
+    the session and six 0x0f for that file id; the second word was 0."""
+    if len(cmd) != 9 or cmd[0] not in (CMD_DOWNLOAD_FILE_ABORT, CMD_DOWNLOAD_MULTI_ABORT):
+        raise ValueError("not a download abort")
+    ident, reserved = struct.unpack(endian + "II", cmd[1:9])
+    key = "file_id" if cmd[0] == CMD_DOWNLOAD_FILE_ABORT else "multi_session_id"
+    return {key: ident, "reserved": reserved}
+
+
+def decode_zero_length(cmd, endian="<"):
+    """ResponseDownloadMultiFileZeroLength (0xa6): <multi u32> <count u16> <fileID u32>*,
+    the files of a request that are empty (from Windows, #50)."""
+    if len(cmd) < 7 or cmd[0] != CMD_ZERO_LENGTH:
+        raise ValueError("not a ResponseDownloadMultiFileZeroLength")
+    multi, count = struct.unpack(endian + "IH", cmd[1:7])
+    if len(cmd) != 7 + 4 * count:
+        raise ValueError("ResponseDownloadMultiFileZeroLength length mismatch")
+    return {"multi_session_id": multi,
+            "file_ids": list(struct.unpack(endian + "%dI" % count, cmd[7:]))}
 
 
 def describe_command(cmd, endian=">"):
@@ -823,6 +879,15 @@ def describe_command(cmd, endian=">"):
     return out
 
 
+def decodes_in(cmd, endian):
+    """True if cmd decodes without error in byte order endian."""
+    try:
+        _command_fields(cmd, endian)
+    except (ValueError, UnicodeDecodeError, struct.error):
+        return False
+    return True
+
+
 def _command_fields(cmd, endian):
     """The decoded fields of cmd, read in byte order endian."""
     out = {}
@@ -834,6 +899,10 @@ def _command_fields(cmd, endian):
         out.update(decode_clipboard(decode_xml_packet(cmd, endian)))
     elif cmd[0] == CMD_CHANGE_ATTRIBUTE:
         out.update(decode_change_file_attribute(cmd, endian))
+    elif cmd[0] in (CMD_DOWNLOAD_FILE_ABORT, CMD_DOWNLOAD_MULTI_ABORT):
+        out.update(decode_download_abort(cmd, endian))
+    elif cmd[0] == CMD_ZERO_LENGTH:
+        out.update(decode_zero_length(cmd, endian))
     elif cmd[0] == CMD_DOMAIN_FOLDERS:
         out.update(decode_domain_folders(cmd, endian))
     elif cmd[0] == CMD_DRIVE_INFO:
@@ -937,7 +1006,7 @@ def decode_get_directory_info(cmd, endian=">"):
     (n,) = struct.unpack(endian + "H", cmd[1:3])
     if 3 + n > len(cmd):
         raise ValueError("GetDirectoryInfo path truncated")
-    return cmd[3:3 + n].decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")
+    return _decode_utf16(cmd[3:3 + n], endian).rstrip("\0")
 
 
 def encode_directory_record(name, attrs, size, ctime, atime, mtime, endian="<"):
@@ -967,13 +1036,12 @@ def decode_directory_info(cmd, endian="<"):
         raise ValueError("not a DirectoryInfo")
     (count,) = struct.unpack(endian + "H", cmd[1:3])
     off, entries = 3, []
-    utf16 = "utf-16-le" if endian == "<" else "utf-16-be"
     for _ in range(count):
         rec = cmd[off:off + DIR_RECORD_LEN]
         if len(rec) != DIR_RECORD_LEN:
             raise ValueError("DirectoryInfo truncated")
         w = struct.unpack_from(endian + "10I", rec)
-        entries.append({"name": rec[40:40 + min(w[9], DIR_NAME_MAX)].decode(utf16),
+        entries.append({"name": _decode_utf16(rec[40:40 + min(w[9], DIR_NAME_MAX)], endian).rstrip("\0"),
                         "attrs": w[0], "directory": bool(w[0] & ATTR_DIRECTORY),
                         "size": (w[8] << 32) | w[7], "ctime": (w[2] << 32) | w[1],
                         "atime": (w[4] << 32) | w[3], "mtime": (w[6] << 32) | w[5]})
@@ -1039,7 +1107,7 @@ def decode_make_new_directory(cmd, endian=">"):
     session_id, n = struct.unpack(endian + "IH", cmd[1:7])
     if 7 + n > len(cmd):
         raise ValueError("MakeNewDirectory path truncated")
-    path = cmd[7:7 + n].decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")
+    path = _decode_utf16(cmd[7:7 + n], endian).rstrip("\0")
     return {"session_id": session_id, "path": path}
 
 
@@ -1062,7 +1130,6 @@ def serve_make_new_directory(cmd, roots, endian="<", request_endian=">"):
 
 def _decode_upload_paths(cmd, off, count, endian):
     """{ <fileID u32> <pathLen u16> <path, UTF-16 + NUL> } * count."""
-    utf16 = "utf-16-be" if endian == ">" else "utf-16-le"
     files = []
     for _ in range(count):
         if off + 6 > len(cmd):
@@ -1071,13 +1138,34 @@ def _decode_upload_paths(cmd, off, count, endian):
         off += 6
         if off + n > len(cmd):
             raise ValueError("upload file path truncated")
-        files.append({"file_id": file_id, "path": cmd[off:off + n].decode(utf16).rstrip("\0")})
+        files.append({"file_id": file_id, "path": _decode_utf16(cmd[off:off + n], endian).rstrip("\0")})
         off += n
     return files
 
 
 def _utf16(endian):
     return "utf-16-be" if endian == ">" else "utf-16-le"
+
+
+def _decode_utf16(raw, endian):
+    """Decode a UTF-16 string whose byte order may differ from the numbers'.
+
+    The Mac picks the string order by the remote's OS, not its own: to a
+    Windows peer it echoes Windows paths in UTF-16LE inside big-endian
+    commands (#50).  Mostly-ASCII text has its zero bytes on one side, which
+    gives the order; with no clear majority the sender's order is used."""
+    raw = bytes(raw)
+    if len(raw) % 2:
+        raise ValueError("odd UTF-16 length %d" % len(raw))
+    zeros_hi_first = sum(1 for b in raw[0::2] if b == 0)
+    zeros_hi_last = sum(1 for b in raw[1::2] if b == 0)
+    if zeros_hi_last > zeros_hi_first:
+        enc = "utf-16-le"
+    elif zeros_hi_first > zeros_hi_last:
+        enc = "utf-16-be"
+    else:
+        enc = _utf16(endian)
+    return raw.decode(enc)
 
 
 def encode_delete(command, session_id, path, endian=">"):
@@ -1094,7 +1182,7 @@ def decode_delete(cmd, endian=">"):
     if 7 + n > len(cmd):
         raise ValueError("delete path truncated")
     return {"session_id": session_id,
-            "path": cmd[7:7 + n].decode(_utf16(endian)).rstrip("\0")}
+            "path": _decode_utf16(cmd[7:7 + n], endian).rstrip("\0")}
 
 
 def encode_rename(session_id, path, new_path, endian=">"):
@@ -1111,8 +1199,8 @@ def decode_rename(cmd, endian=">"):
     session_id, n_old, n_new = struct.unpack(endian + "IHH", cmd[1:9])
     if 9 + n_old + n_new > len(cmd):
         raise ValueError("rename paths truncated")
-    old = cmd[9:9 + n_old].decode(_utf16(endian)).rstrip("\0")
-    new = cmd[9 + n_old:9 + n_old + n_new].decode(_utf16(endian)).rstrip("\0")
+    old = _decode_utf16(cmd[9:9 + n_old], endian).rstrip("\0")
+    new = _decode_utf16(cmd[9 + n_old:9 + n_old + n_new], endian).rstrip("\0")
     return {"session_id": session_id, "path": old, "new_path": new}
 
 

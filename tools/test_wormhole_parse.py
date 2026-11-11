@@ -1194,6 +1194,20 @@ class TestUpipeReassembly(unittest.TestCase):
                                ("send", "Login", None), ("send", "ResponseResult", 108),
                                ("send", "DownloadMultiFileFinished", 108)])
 
+    def test_sender_byte_order_is_learned_without_a_login(self):
+        # A capture started after the Login: the first command that only
+        # decodes in the other byte order sets the sender's order, so later
+        # commands without internal checks (session ids) read right.
+        g = up.Framer(session=1)
+        send = (g.frame(up.encode_download_finished(5, "<"))   # before: unknown
+                + g.frame(up.encode_xml_packet("<a/>")[:1]
+                          + struct.pack("<I", 4) + b"<a/>")    # only "<" decodes
+                + g.frame(up.encode_response(0x10, session_id=111, endian="<"))
+                + g.frame(up.encode_download_finished(111, "<")))
+        cmds = wp.reassemble_upipe(wp.parse_transactions(
+            self._packets(send, SEND, False, start=100, tag0=50)))
+        self.assertEqual([c.get("session_id") for c in cmds][2:], [111, 111])
+
     def test_failed_send_is_not_counted(self):
         # A send rejected with CHECK CONDITION (no fetching peer) is
         # retried by the sender; the rejected copy carries nothing.
