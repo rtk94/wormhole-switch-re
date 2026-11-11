@@ -142,8 +142,11 @@ Sent via `SCSITask` (`ExecuteTaskSync`, 2000 ms timeout); sense
 `(key<<16 | ASC<<8 | ASCQ)` is mapped to OTi result codes.
 The cable microcontroller forwards the packet to the peer end, whose
 host software replays it as a CGEvent (macOS) / HID report (Windows).
-File/clipboard traffic uses the same SCSI plumbing with a data phase;
-its packet magic has not been captured yet.
+File/clipboard traffic uses the same SCSI plumbing with a data phase:
+a `0xD8` status poll plus `0xD9 0x28` (fetch) / `0xD9 0x2A` (send)
+64 KiB transfers, each side polling the cable. The framing, the GoBridge
+command layer and a Linux peer implementation are in
+[upipe-protocol.md](upipe-protocol.md).
 
 This only appears on the wire when Wormhole/GoBridge software is
 actively transferring — the idle capture in `docs/capture-log.md`

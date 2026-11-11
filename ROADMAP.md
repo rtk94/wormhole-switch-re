@@ -45,13 +45,13 @@ Milestones track the reverse-engineering progression from initial enumeration to
 
 The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and verified end-to-end. Multimedia `'6'` mapped (all-zero probe; inferred `payload[0]` = usage). The **file/clipboard channel** uses the same SCSI Bulk-Only pipe with a different vendor CDB magic (not yet captured).
 
-- [ ] Capture live peer-active session with file drag / clipboard copy (both ends running GoBridge/Wormhole)
-- [ ] Identify UPipe CDB magic byte(s) — parser already flags `candidate_upipe` for any vendor-range CDB (`0xC0`–`0xFF`) with a data phase
-- [ ] Decode UPipe framing: chunking, sequence, CRC, file metadata, clipboard MIME types
+- [ ] Capture live peer-active session with file drag / clipboard copy (both ends running GoBridge/Wormhole) — Linux ↔ macOS link and login handshake captured 2026-11-11 (`docs/upipe-protocol.md`); file/clipboard payloads still to capture
+- [x] Identify UPipe CDB magic byte(s) — `0xD8` poll, `0xD9 0x28` fetch, `0xD9 0x2A` send (`docs/upipe-protocol.md`)
+- [ ] Decode UPipe framing: chunking, sequence, CRC, file metadata, clipboard MIME types — packet tail check, chunk header, terminator, Login/ResponseResult decoded; file and clipboard commands open
 - [ ] Verify bidirectional symmetry (PC A → PC B vs PC B → PC A)
-- [ ] Document in `docs/transport.md` (new section) + new `docs/upipe-protocol.md`
+- [x] Document in `docs/transport.md` (new section) + new `docs/upipe-protocol.md`
 
-**Blocker:** Requires two machines with GoBridge running simultaneously and a filtered usbmon capture. Wine/Xvfb cannot establish the peer link (OLE apartment init fails). Parser is ready (`tools/wormhole_parse.py` decodes `0xD9` HID + flags UPipe candidates). Capture pipeline verified with synthetic packets.
+**Status:** `tools/upipe_peer.py` stands in for the GoBridge peer on Linux (poll/fetch/send plus the login handshake), and `tools/gobridge_scsi.d` traces the macOS side. Remaining: drive a clipboard copy and a file drag on the Mac with the Linux peer logged in, and decode those commands.
 
 ---
 
