@@ -317,6 +317,74 @@ class TestDescribeEndian(unittest.TestCase):
         self.assertEqual(d["session_id"], 103)
 
 
+class TestWindowsPeer(unittest.TestCase):
+    """A Windows peer writes its fields little-endian (first Windows <-> Mac
+    session, 2026-11-11, #50); the Mac writes them big-endian."""
+
+    def test_xml_packet_little_endian_length(self):
+        xml = "<NP_Cmd>Cmd_Delete_Src_Temp_File</NP_Cmd>"
+        cmd = bytes([u.CMD_XML]) + struct.pack("<I", len(xml)) + xml.encode()
+        self.assertEqual(u.decode_xml_packet(cmd, "<"), xml)
+        for endian in ("<", ">"):  # ">" falls back to the other byte order
+            d = u.describe_command(cmd, endian)
+            self.assertNotIn("decode_error", d)
+            self.assertEqual(d["np_cmd"], "Cmd_Delete_Src_Temp_File")
+
+    def test_xml_packet_big_endian_still_default(self):
+        cmd = u.encode_xml_packet("<NP_Cmd>x</NP_Cmd>")
+        self.assertEqual(u.decode_xml_packet(cmd), "<NP_Cmd>x</NP_Cmd>")
+
+    def test_get_directory_info_little_endian(self):
+        cmd = u.encode_get_directory_info("/Users/someone/Desktop", "<")
+        self.assertEqual(u.describe_command(cmd, "<")["path"], "/Users/someone/Desktop")
+        d = u.describe_command(cmd, ">")
+        self.assertNotIn("decode_error", d)
+        self.assertEqual(d["path"], "/Users/someone/Desktop")
+
+    def test_change_file_attribute_layout(self):
+        # 37 <attributes u32> <ctime> <atime> <mtime> (FILETIME u64 each)
+        #    <path length u32, bytes> <path, UTF-16, no NUL>
+        cmd = u.encode_change_file_attribute("/var/folders/x/T/f", 0x20,
+                                             1700000000, 1700000001, 1700000002, "<")
+        path = "/var/folders/x/T/f".encode("utf-16-le")
+        self.assertEqual(cmd[0], 0x37)
+        self.assertEqual(cmd[1:5], struct.pack("<I", 0x20))
+        self.assertEqual(struct.unpack("<Q", cmd[5:13])[0], u.filetime_from_unix(1700000000))
+        self.assertEqual(cmd[29:33], struct.pack("<I", len(path)))
+        self.assertEqual(cmd[33:], path)
+        d = u.describe_command(cmd, "<")
+        self.assertEqual(d["command_name"], "ChangeFileAttribute")
+        self.assertEqual((d["attributes"], d["path"]), (0x20, "/var/folders/x/T/f"))
+        self.assertEqual((d["ctime"], d["atime"], d["mtime"]),
+                         (1700000000, 1700000001, 1700000002))
+
+    def test_change_file_attribute_truncated(self):
+        cmd = u.encode_change_file_attribute("/a", 0x20, 0, 0, 0, "<")
+        with self.assertRaises(ValueError):
+            u.decode_change_file_attribute(cmd[:-1], "<")
+
+    def test_windows_package_with_attribute_command(self):
+        # Windows fills the 11 reserved bytes with stale buffer contents and
+        # follows each file's 0xa3 with a 0x37 for the destination path.
+        a3 = u.encode_file_data(115, 1, 1, b"Version:0.9", "<")
+        attr = u.encode_change_file_attribute("/var/folders/x/T/CBAx", 0x20, 1, 2, 3, "<")
+        pkg = (bytes([u.CMD_PACKAGE]) + struct.pack("<I", 2)
+               + bytes.fromhex("037d02ae0900003c4f5449") + a3 + attr)
+        self.assertEqual(u.decode_multiple_file_package(pkg, "<"), [a3, attr])
+        for endian in ("<", ">"):
+            d = u.describe_command(pkg, endian)
+            self.assertNotIn("decode_error", d)
+            self.assertEqual([c["command_name"] for c in d["commands"]],
+                             ["DownloadFileData", "ChangeFileAttribute"])
+            self.assertEqual(d["commands"][0]["file_id"], 115)
+            self.assertEqual(d["commands"][1]["path"], "/var/folders/x/T/CBAx")
+
+    def test_package_rejects_unknown_subcommand(self):
+        pkg = u.encode_multiple_file_package([bytes([0x39]) + bytes(20)])
+        with self.assertRaises(ValueError):
+            u.decode_multiple_file_package(pkg, "<")
+
+
 class TestImageFetcher(unittest.TestCase):
     """--save-clipboard-images: fetch each image the Mac copies."""
 

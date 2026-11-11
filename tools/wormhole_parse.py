@@ -184,14 +184,32 @@ UPIPE_NAMES = {
     "fetch": "UPIPE FETCH (0xD9 0x28)",
     "send": "UPIPE SEND (0xD9 0x2A)",
 }
+# Only d8 00 03 is the 16-byte status poll (GetRemoteHostStatus).  A Windows
+# peer also sends d8 00 05 (8 bytes in) and d8 01 04 ... (no data); their
+# meaning is open (#50), so they are reported as "control".
+UPIPE_POLL_SUBCOMMAND = b"\x00\x03"
+
+# Vendor opcodes seen from a Windows peer (#50) that are not UPipe chunks.
+OTHER_VENDOR_NAMES = {
+    0xF0: "VENDOR 0xF0 (GetPhysicalBusType?)",
+    0xE1: "VENDOR 0xE1 (512-byte read)",
+}
+
+
+def upipe_name(cdb: bytes) -> str | None:
+    """Display name of a UPipe CDB."""
+    kind = upipe_kind(cdb)
+    if kind == "control":
+        return "UPIPE CONTROL (0xD8 %s)" % cdb[1:3].hex(" ").upper()
+    return UPIPE_NAMES.get(kind) if kind else None
 
 
 def upipe_kind(cdb: bytes) -> str | None:
-    """'poll', 'fetch' or 'send' for a UPipe CDB, else None."""
+    """'poll', 'control', 'fetch' or 'send' for a UPipe CDB, else None."""
     if not cdb:
         return None
     if cdb[0] == UPIPE_POLL_OPCODE:
-        return "poll"
+        return "poll" if cdb[1:3] == UPIPE_POLL_SUBCOMMAND else "control"
     if cdb[0] == VENDOR_HID_MAGIC and len(cdb) >= 2:
         return UPIPE_TRANSFER_TYPES.get(cdb[1])
     return None
@@ -467,7 +485,7 @@ class Transaction:
     @property
     def opcode_name(self) -> str:
         if self.is_upipe:
-            return UPIPE_NAMES[self.upipe_kind]
+            return upipe_name(self.cbw.cdb)
         return SCSI_OPCODES.get(self.opcode, "UNKNOWN 0x%02X" % self.opcode)
 
     @property
@@ -568,7 +586,7 @@ def decode_vendor_cdb(cdb: bytes) -> dict:
     kind = upipe_kind(cdb)
     if kind is not None:
         out.update({"is_vendor_hid": False, "is_upipe": True,
-                    "upipe_kind": kind, "name": UPIPE_NAMES[kind]})
+                    "upipe_kind": kind, "name": upipe_name(cdb)})
         if len(cdb) >= 16:
             out["footer_ok"] = cdb[14:16] == VENDOR_HID_FOOTER
         if kind == "poll" and len(cdb) >= 5:
@@ -607,6 +625,9 @@ def decode_vendor_cdb(cdb: bytes) -> dict:
         # reported verbatim (possible UPipe/data-phase spill).
         if len(cdb) > VENDOR_HID_LEN:
             out["trailing_hex"] = cdb[VENDOR_HID_LEN:].hex()
+    elif op in OTHER_VENDOR_NAMES:
+        out["is_vendor_hid"] = False
+        out["name"] = OTHER_VENDOR_NAMES[op]
     else:
         out["is_vendor_hid"] = False
         # Generic vendor CDB: likely a file/clipboard UPipe packet.
@@ -1014,6 +1035,8 @@ def decode_data(txn: Transaction) -> dict:
                 out["upipe_status"] = upipe.parse_status(data)
             except ValueError as e:
                 out["upipe_status"] = {"decode_error": str(e)}
+        elif kind == "control":
+            pass                                  # meaning open (#50): raw only
         elif kind is not None:
             chunk = decode_upipe_chunk(data)
             out["upipe_chunk"] = chunk
@@ -1081,9 +1104,12 @@ def reassemble_upipe(txns: list[Transaction]) -> list[dict]:
     from the peer, 'send' = to the peer) and per command session, as
     CommandDataBuffer does.  Only transactions with a good CSW count: a
     send the cable rejected is retried by the sender.  Each completed
-    command is decoded with upipe_peer.describe_command.
+    command is decoded with upipe_peer.describe_command, in the byte order
+    its sender's Login announces (big-endian for the Mac, little-endian
+    for Windows and Linux; big-endian until a Login is seen).
     """
     state: dict[tuple, tuple[upipe.Reassembler, dict]] = {}
+    endian: dict[tuple, str] = {}   # sender byte order, from its Login
     out: list[dict] = []
     for t in txns:
         kind = t.upipe_kind
@@ -1104,12 +1130,16 @@ def reassemble_upipe(txns: list[Transaction]) -> list[dict]:
         if cmd is None:
             continue
         cmd_frames = frames.pop(chunk["session"])
+        fields = upipe.describe_command(cmd, endian.get(key, ">"))
+        if fields.get("command") == upipe.CMD_LOGIN and "os_type" in fields:
+            # The Mac writes big-endian; Windows and Linux little-endian.
+            endian[key] = ">" if fields["os_type"] == "mac" else "<"
         out.append({
             "capture_id": t.capture_id, "bus": t.bus, "dev": t.dev,
             "direction": kind, "session": chunk["session"],
             "first_frame": min(cmd_frames), "last_frame": max(cmd_frames),
             "chunks": len(cmd_frames),
-            **upipe.describe_command(cmd),
+            **fields,
         })
     return out
 
@@ -1186,7 +1216,7 @@ def summarise(pcap: PcapData) -> dict:
                 for t in vendor_hid)),
             "vendor_cdb_packets": len(vendor_all),
             "upipe_packets": {k: upipe_counts.get(k, 0)
-                              for k in ("poll", "fetch", "send")},
+                              for k in ("poll", "fetch", "send", "control")},
             "upipe_commands": sum(
                 1 for c in upipe_cmds if (c["bus"], c["dev"]) == key),
             # vendor CDBs that are neither HID nor a known UPipe CDB
@@ -1212,7 +1242,7 @@ def summarise(pcap: PcapData) -> dict:
             sum(d["upipe_packets"].values()) for d in per_device.values()),
         "upipe_packets": {k: sum(d["upipe_packets"][k]
                                  for d in per_device.values())
-                          for k in ("poll", "fetch", "send")},
+                          for k in ("poll", "fetch", "send", "control")},
         "upipe_commands": upipe_cmds,
         "total_hid_reports": len(hid_reports),
         "hid_reports": hid_reports,
@@ -1293,6 +1323,9 @@ def _fmt_upipe_data(t: dict) -> str:
             if "waiting" in st:
                 parts.append("waiting=%d" % st["waiting"])
         return " ".join(parts)
+    if t.get("upipe_kind") == "control":
+        return "data[%d]=%s" % (data.get("len", 0), (data.get("hex") or "")[:48]) if data \
+            else "no data"
     chunk = data.get("upipe_chunk")
     if not chunk:
         return "no data"
@@ -1490,10 +1523,10 @@ def main(argv: list[str] | None = None) -> int:
         summary["packets"], summary["duration_s"], summary["linktype"]))
     up_counts = summary.get("upipe_packets", {})
     print("Vendor HID (0xD9) packets: %d  UPipe: poll %d / fetch %d / send %d"
-          "  other vendor CDBs: %d  HID reports: %d" % (
+          " / control %d  other vendor CDBs: %d  HID reports: %d" % (
               summary.get("total_vendor_hid_packets", 0),
               up_counts.get("poll", 0), up_counts.get("fetch", 0),
-              up_counts.get("send", 0),
+              up_counts.get("send", 0), up_counts.get("control", 0),
               summary.get("total_candidate_upipe_packets", 0),
               summary.get("total_hid_reports", 0)))
     print()

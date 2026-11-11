@@ -89,6 +89,7 @@ CMD_DIRECTORY_INFO = 0xA2
 CMD_DOWNLOAD_MULTI = 0x10
 CMD_XML = 0x39
 CMD_PACKAGE = 0x3A
+CMD_CHANGE_ATTRIBUTE = 0x37
 CMD_RESPONSE = 0xA1
 CMD_FILE_DATA = 0xA3
 CMD_DOWNLOAD_FINISHED = 0xA7; CMD_UPLOAD_ERROR = 0xA9
@@ -308,10 +309,12 @@ def encode_xml_packet(xml):
     return bytes([CMD_XML]) + struct.pack(">I", len(raw)) + raw
 
 
-def decode_xml_packet(cmd):
+def decode_xml_packet(cmd, endian=">"):
+    """The XML of an XmlPacket.  The length is in the sender's byte order:
+    big-endian from the Mac, little-endian from Windows (#50)."""
     if len(cmd) < 5 or cmd[0] != CMD_XML:
         raise ValueError("not an XmlPacket")
-    n = struct.unpack(">I", cmd[1:5])[0]
+    n = struct.unpack(endian + "I", cmd[1:5])[0]
     if 5 + n > len(cmd):
         raise ValueError("XmlPacket length %d exceeds command" % n)
     return cmd[5:5 + n].decode("utf-8", "replace")
@@ -343,6 +346,39 @@ FILETIME_UNIX_EPOCH = 116444736000000000
 def filetime_from_unix(t):
     """Windows FILETIME (100 ns ticks since 1601) for a Unix timestamp."""
     return FILETIME_UNIX_EPOCH + int(round(t * 10 ** 7))
+
+
+def unix_from_filetime(ft):
+    """Unix seconds (rounded) for a Windows FILETIME."""
+    return int(round((ft - FILETIME_UNIX_EPOCH) / 10 ** 7))
+
+
+CHANGE_ATTRIBUTE_HEADER = 33   # id + attributes u32 + 3 FILETIMEs + path length u32
+
+
+def encode_change_file_attribute(path, attributes, ctime, atime, mtime, endian="<"):
+    """ChangeFileAttribute (0x37) as a Windows peer sends it after each
+    downloaded file (#50): 37 <attributes u32> <ctime> <atime> <mtime>
+    (FILETIME u64 each) <path length u32, bytes> <path, UTF-16, no NUL>.
+    The path is the receiver's destination path."""
+    raw = path.encode("utf-16-be" if endian == ">" else "utf-16-le")
+    return (bytes([CMD_CHANGE_ATTRIBUTE])
+            + struct.pack(endian + "IQQQI", attributes, filetime_from_unix(ctime),
+                          filetime_from_unix(atime), filetime_from_unix(mtime), len(raw))
+            + raw)
+
+
+def decode_change_file_attribute(cmd, endian="<"):
+    if len(cmd) < CHANGE_ATTRIBUTE_HEADER or cmd[0] != CMD_CHANGE_ATTRIBUTE:
+        raise ValueError("not a ChangeFileAttribute")
+    attributes, ct, at, mt, n = struct.unpack(endian + "IQQQI",
+                                              cmd[1:CHANGE_ATTRIBUTE_HEADER])
+    if CHANGE_ATTRIBUTE_HEADER + n > len(cmd):
+        raise ValueError("ChangeFileAttribute path truncated")
+    raw = cmd[CHANGE_ATTRIBUTE_HEADER:CHANGE_ATTRIBUTE_HEADER + n]
+    return {"attributes": attributes, "ctime": unix_from_filetime(ct),
+            "atime": unix_from_filetime(at), "mtime": unix_from_filetime(mt),
+            "path": raw.decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")}
 
 
 def encode_node_info(path, size, ctime, atime, mtime):
@@ -558,18 +594,25 @@ def encode_multiple_file_package(commands):
 
 
 def decode_multiple_file_package(cmd, endian="<"):
-    """The file-data commands (0xa3, 0x0c) inside a MultipleFilePackage."""
+    """The commands inside a MultipleFilePackage: file data (0xa3, 0x0c) and,
+    from a Windows peer, ChangeFileAttribute (0x37) after each file (#50).
+    Windows fills the 11 reserved bytes with stale buffer contents."""
     if len(cmd) < 5 + PACKAGE_RESERVED or cmd[0] != CMD_PACKAGE:
         raise ValueError("not a MultipleFilePackage")
     (count,) = struct.unpack("<I", cmd[1:5])
     off, out = 5 + PACKAGE_RESERVED, []
     for _ in range(count):
-        if off + FILE_DATA_HEADER > len(cmd) or cmd[off] not in (CMD_FILE_DATA,
-                                                                  CMD_UPLOAD_FILE_DATA):
-            raise ValueError("MultipleFilePackage command %d truncated or not file data"
+        if off < len(cmd) and cmd[off] in (CMD_FILE_DATA, CMD_UPLOAD_FILE_DATA):
+            header, length_at = FILE_DATA_HEADER, 13
+        elif off < len(cmd) and cmd[off] == CMD_CHANGE_ATTRIBUTE:
+            header, length_at = CHANGE_ATTRIBUTE_HEADER, 29
+        else:
+            raise ValueError("MultipleFilePackage command %d truncated or unsupported"
                              % len(out))
-        (length,) = struct.unpack(endian + "I", cmd[off + 13:off + 17])
-        end = off + FILE_DATA_HEADER + length
+        if off + header > len(cmd):
+            raise ValueError("MultipleFilePackage command %d truncated" % len(out))
+        (length,) = struct.unpack(endian + "I", cmd[off + length_at:off + length_at + 4])
+        end = off + header + length
         if end > len(cmd):
             raise ValueError("MultipleFilePackage command %d truncated" % len(out))
         out.append(cmd[off:end])
@@ -668,56 +711,68 @@ def describe_command(cmd, endian=">"):
     """Decode a command for logging.
 
     endian is the sender's byte order: the Mac's commands are big-endian,
-    the replies this tool sends to the Mac little-endian.
+    the replies this tool sends to the Mac and a Windows peer's commands
+    little-endian.  When a command does not decode in that byte order the
+    other one is tried; fields with no internal check (session ids) can
+    only be right if endian is.
     """
     if not cmd:
         return {"command": None}
     out = {"command": cmd[0], "command_name": COMMANDS.get(cmd[0], "unknown"), "len": len(cmd)}
+    other = "<" if endian == ">" else ">"
     try:
-        if cmd[0] == CMD_LOGIN:
-            out.update(decode_login(cmd))
-        elif cmd[0] == CMD_RESPONSE:
-            out.update(decode_response(cmd, endian))
-        elif cmd[0] == CMD_XML:
-            out.update(decode_clipboard(decode_xml_packet(cmd)))
-        elif cmd[0] == CMD_FILE_DATA:
-            d = decode_file_data(cmd, endian)
-            d.pop("data")
-            out.update(d)
-        elif cmd[0] == CMD_DOWNLOAD_FINISHED and len(cmd) >= 5:
-            out["session_id"] = struct.unpack(endian + "I", cmd[1:5])[0]
-        elif cmd[0] == CMD_UPLOAD_ERROR:
-            out.update(decode_upload_error(cmd, endian))
-        elif cmd[0] == CMD_GET_DIRECTORY_INFO:
-            out["path"] = decode_get_directory_info(cmd, endian)
-        elif cmd[0] == CMD_MAKE_NEW_DIRECTORY:
-            out.update(decode_make_new_directory(cmd, endian))
-        elif cmd[0] == CMD_PACKAGE:
-            subs = decode_multiple_file_package(cmd, endian)
-            out["count"] = len(subs)
-            out["commands"] = [describe_command(c, endian) for c in subs]
-        elif cmd[0] in (CMD_DELETE_FILE, CMD_DELETE_DIRECTORY):
-            out.update(decode_delete(cmd, endian))
-        elif cmd[0] == CMD_RENAME_FILE:
-            out.update(decode_rename(cmd, endian))
-        elif cmd[0] == CMD_UPLOAD_CONFIRM:
-            out.update(decode_upload_files(cmd, endian))
-        elif cmd[0] in (CMD_UPLOAD_MULTI, CMD_UPLOAD_ZERO):
-            out.update(decode_upload_multi(cmd, endian))
-        elif cmd[0] == CMD_UPLOAD_FILE_DATA and len(cmd) >= FILE_DATA_HEADER:
-            out.update(zip(("file_id", "total", "index", "data_length"),
-                           struct.unpack(endian + "IIII", cmd[1:FILE_DATA_HEADER])))
-        elif cmd[0] == CMD_DIRECTORY_INFO:
-            d = decode_directory_info(cmd, endian)
-            out.update({"entries": len(d["entries"]), "free_space": d.get("free_space")})
-        elif cmd[0] == CMD_DOWNLOAD_MULTI:
-            other = "<" if endian == ">" else ">"
-            try:                        # the Mac sends big-endian, Linux little
-                out.update(decode_download_request(cmd, endian))
-            except (ValueError, UnicodeDecodeError):
-                out.update(decode_download_request(cmd, other))
-    except ValueError as e:
-        out["decode_error"] = str(e)
+        out.update(_command_fields(cmd, endian))
+    except (ValueError, UnicodeDecodeError, struct.error) as e:
+        try:
+            out.update(_command_fields(cmd, other))
+        except (ValueError, UnicodeDecodeError, struct.error):
+            out["decode_error"] = str(e)
+    return out
+
+
+def _command_fields(cmd, endian):
+    """The decoded fields of cmd, read in byte order endian."""
+    out = {}
+    if cmd[0] == CMD_LOGIN:
+        out.update(decode_login(cmd))
+    elif cmd[0] == CMD_RESPONSE:
+        out.update(decode_response(cmd, endian))
+    elif cmd[0] == CMD_XML:
+        out.update(decode_clipboard(decode_xml_packet(cmd, endian)))
+    elif cmd[0] == CMD_CHANGE_ATTRIBUTE:
+        out.update(decode_change_file_attribute(cmd, endian))
+    elif cmd[0] == CMD_FILE_DATA:
+        d = decode_file_data(cmd, endian)
+        d.pop("data")
+        out.update(d)
+    elif cmd[0] == CMD_DOWNLOAD_FINISHED and len(cmd) >= 5:
+        out["session_id"] = struct.unpack(endian + "I", cmd[1:5])[0]
+    elif cmd[0] == CMD_UPLOAD_ERROR:
+        out.update(decode_upload_error(cmd, endian))
+    elif cmd[0] == CMD_GET_DIRECTORY_INFO:
+        out["path"] = decode_get_directory_info(cmd, endian)
+    elif cmd[0] == CMD_MAKE_NEW_DIRECTORY:
+        out.update(decode_make_new_directory(cmd, endian))
+    elif cmd[0] == CMD_PACKAGE:
+        subs = decode_multiple_file_package(cmd, endian)
+        out["count"] = len(subs)
+        out["commands"] = [describe_command(c, endian) for c in subs]
+    elif cmd[0] in (CMD_DELETE_FILE, CMD_DELETE_DIRECTORY):
+        out.update(decode_delete(cmd, endian))
+    elif cmd[0] == CMD_RENAME_FILE:
+        out.update(decode_rename(cmd, endian))
+    elif cmd[0] == CMD_UPLOAD_CONFIRM:
+        out.update(decode_upload_files(cmd, endian))
+    elif cmd[0] in (CMD_UPLOAD_MULTI, CMD_UPLOAD_ZERO):
+        out.update(decode_upload_multi(cmd, endian))
+    elif cmd[0] == CMD_UPLOAD_FILE_DATA and len(cmd) >= FILE_DATA_HEADER:
+        out.update(zip(("file_id", "total", "index", "data_length"),
+                       struct.unpack(endian + "IIII", cmd[1:FILE_DATA_HEADER])))
+    elif cmd[0] == CMD_DIRECTORY_INFO:
+        d = decode_directory_info(cmd, endian)
+        out.update({"entries": len(d["entries"]), "free_space": d.get("free_space")})
+    elif cmd[0] == CMD_DOWNLOAD_MULTI:
+        out.update(decode_download_request(cmd, endian))
     return out
 
 

@@ -49,6 +49,21 @@ fetch or send depending on the reply.
 - `0xF0` is probably `GetPhysicalBusType` (called from `ProcessIdleState`
   when the peer comes online). Unconfirmed.
 
+A Windows peer (first session 2026-11-11, #50) issues more CDBs than the Mac,
+around its Login. Their meaning is open; the parser names them but does not
+decode their data:
+
+| CDB from Windows | Data phase | Parser name |
+|---|---|---|
+| `f0 00 00 …` | 23 or 36 B in (bytes 2–3 `22 11`, the PID) | `VENDOR 0xF0 (GetPhysicalBusType?)` |
+| `e1 03 00 00 00 <80/81> 00 00 01 …` | 512 B in, high-entropy | `VENDOR 0xE1 (512-byte read)` |
+| `d8 00 05 …` | 8 B in | `UPIPE CONTROL (0xD8 00 05)` |
+| `d8 01 04 06 40 00 00 00 04 …` | none | `UPIPE CONTROL (0xD8 01 04)` |
+| `d9 3a 01 …` | 9 B in (`ff`×9) | vendor HID, unknown type |
+
+Only `d8 00 03` is the 16-byte status poll; the parser reports every other
+`0xD8` as `control`.
+
 ### Compared with the HID `0xD9` path
 
 | | HID injection | UPipe |
@@ -134,6 +149,13 @@ accepted little-endian ResponseResult, `0xa3`, `0xa7` and `0xa9` from Linux
 when it requested files (`serve` runs). Login's code page is zero in
 practice, so its order was not tested.
 
+A Windows peer (OS `0x07`) writes its fields little-endian too: XmlPacket
+lengths, GetDirectoryInfo path lengths, session IDs and the commands inside a
+MultipleFilePackage (#50). `tools/wormhole_parse.py` takes each direction's
+byte order from that direction's Login (big-endian for `mac`, little-endian
+otherwise), and `describe_command` retries in the other order when a command
+does not decode.
+
 IDs known to `CommandDataBuffer commandClassForCommandID:`: `0x00` (dummy),
 `0x01`, `0x02`, `0x04`, `0x06`–`0x09`, `0x0c`, `0x0e`, `0x10`–`0x15`, `0x37`,
 `0x39`, `0x3a`, `0xa1`–`0xa9`, `0xad`. Server side (`THMGBServer`):
@@ -174,8 +196,8 @@ Every command travels in the same `d9 2a` send and `d9 28` fetch packets.
 What tells them apart is byte 0 of the reassembled command, not the CDB.
 Handlers are `THMGBServer(ServerCommandHandler)` for IDs below `0xa0` and
 `THMGBClient(ClientCommandHandler)` for `0xa0` and up. Payload fields are in
-the sender's byte order: the Mac sends big-endian, and a Linux peer sends
-little-endian ([Layer 4](#layer-4-commands)). Paths are UTF-16.
+the sender's byte order: the Mac sends big-endian, and a Linux or Windows peer
+sends little-endian ([Layer 4](#layer-4-commands)). Paths are UTF-16.
 
 | Handler | ID | Payload after the ID | Reply | Status |
 |---|---|---|---|---|
@@ -193,9 +215,9 @@ little-endian ([Layer 4](#layer-4-commands)). Paths are UTF-16.
 | `handleUploadMutipleFilesConfirm:` | `0x13` | `<multi u32> <size u64> <large u16> <count u16> {…}` | `0xa8` | live |
 | `handleUploadMultipleFileAbort:` | `0x14` | `<multi u32>` | none | from the decompile, not observed |
 | `handleUploadMultipleFilesWithZeroLength:` | `0x15` | as `0x12` | `0xa9` code 3 on failure only | live |
-| `handleChangeFileAttribute:` | `0x37` | not decoded | — | not observed |
+| `handleChangeFileAttribute:` | `0x37` | `<attributes u32> <ctime u64> <atime u64> <mtime u64> <len u32> <path>`; times are FILETIME | none seen | live, Windows → Mac, inside `0x3a` after each `0xa3` |
 | `handleExtraXMLPacket:` | `0x39` | `<xmlLen u32> <xml>` | none | live, both ways (clipboard, drive list) |
-| (`THMFileManager handleMultipleFilePackage:`) | `0x3a` | `<count u32 LE> <11 bytes> <commands>` | per command | live, peer → Mac only |
+| (`THMFileManager handleMultipleFilePackage:`) | `0x3a` | `<count u32 LE> <11 bytes> <commands>` | per command | live, Linux and Windows → Mac |
 | `handleRequestResponse:` | `0xa1` | see [ResponseResult](#responseresult-0xa1) | — | live |
 | `handleDirectoryInfo:` | `0xa2` | `<count u16> <552-byte records> <free u64> <pad>` | — | live |
 | `handleDownloadFileData:` | `0xa3` | as `0x0c` | — | live, both ways |
@@ -422,6 +444,12 @@ the Mac logged `counts=4`, `Exit from MultipleFilePackage:initFromData:`, then
 whole-file `0xa3` pieces (single-piece files next to each other in the
 request) up to 8 MiB per package. A run of one, and pieces of split files,
 stay bare.
+
+A Windows peer packages even a single file (#50): serving a clipboard file,
+it sent one `0x3a` with count 2, the `0xa3` (whole file, little-endian)
+followed by a `0x37` ChangeFileAttribute (attributes `0x20`, three FILETIMEs,
+the Mac's destination path). Its 11 reserved bytes held stale buffer contents
+(part of an earlier XmlPacket), not zeros, so they are ignored.
 
 ### Serving to the Mac
 
@@ -667,13 +695,17 @@ Mac-side items are tracked in #51; the Windows formats and parity in #50.
 - Drag-and-drop: what it needs from the peer (likely the mouse/KM side; the
   Mac abandoned the drag).
 - Other `0xa9` error codes.
-- `0x37` ChangeFileAttribute: the Mac logs `setAttribute: 0` after each
-  downloaded file but sent none in the tests.
-- `0x0a` UploadFile, `0x0d`, `0xaa`, `0xa4`, `0xa5`, `0xa6`, `0xab`: when
-  the Mac uses them.
+- `0x37` ChangeFileAttribute: decoded from a Windows peer (inside `0x3a`);
+  the Mac logs `setAttribute: 0` after each downloaded file but has not sent
+  one.
+- `0x0a` UploadFile, `0x0d`, `0xaa`, `0xa5`, `0xa6`, `0xab`: when the Mac
+  uses them.
 - The aborts (`0x11`, `0x14`): cancel a transfer mid-way to capture them.
 - The other clipboard formats (`CB_Format_DIB`, `CB_Format_MutipleImages`,
-  RTF, HTML, PDF): expected from Windows peers; only text, file and TIFF seen.
-- `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.
+  RTF, PDF): expected from Windows peers; text, file, TIFF and (from Windows)
+  `HTML Format` seen.
+- DomainFolders (`0xad`) and DriveInfo (`0xa4`): sent both ways in the
+  Windows session, layouts not decoded.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
-- Windows peer parity: the same commands are expected but not yet captured.
+- The Windows-only CDBs above (`0xE1`, `d8 00 05`, `d8 01 04`, `d9 3a`).
+- Windows peer parity: the deliberate capture in #50.
