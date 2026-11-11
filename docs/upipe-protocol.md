@@ -109,8 +109,10 @@ the UTF-16 order, by `remoteIsBigEndian` (implemented in `KMClipboard.dylib`,
 not decompiled). For a Linux peer (OS `0x20`) that is false: the Mac reads our
 fields little-endian and our strings as UTF-16LE, while still sending its own
 big-endian. A big-endian `0x10` request from Linux crashed GoBridgeDemon (see
-[Evidence](#evidence-2026-11-11)). Login's code page and ResponseResult are
-single-byte or zero in practice, so the order there was not tested.
+[Evidence](#evidence-2026-11-11)). The same holds for replies: the Mac
+accepted little-endian ResponseResult, `0xa3`, `0xa7` and `0xa9` from Linux
+when it requested files (`serve` runs). Login's code page is zero in
+practice, so its order was not tested.
 
 IDs known to `CommandDataBuffer commandClassForCommandID:`: `0x00` (dummy),
 `0x01`, `0x02`, `0x04`, `0x06`–`0x09`, `0x0c`, `0x0e`, `0x10`–`0x15`, `0x37`,
@@ -218,8 +220,16 @@ The XML is one line; indented here:
   | 808 | 4 | size low (observed 91 713 for a 91.7 KB `.jpg`) |
   | 812 | 12 | zero in the one sample; meaning unconfirmed |
 
+  All fields are little-endian (the Windows layout), from either side.
   This carries metadata only. The receiver fetches the contents with
   [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents).
+- Files from Linux (`--offer`): the encoder reproduces the Mac's 2 049-byte
+  file packet byte for byte. A Linux peer must send the plain POSIX path:
+  the Mac names the pasted file after the text behind the last `/`, so the
+  Mac's own `/\…` form made the whole path the file name. On paste in
+  Finder the Mac logs `Detect dummy paste file, start the download...`,
+  writes a `.SKMClipboardFileOfPaste` placeholder and requests the files
+  with `0x10`, using the same paths.
 - The named-pipe name and `HookAppService` are Windows clipboard-agent
   routing, sent unchanged by the Mac.
 - No reply is sent or expected in either direction.
@@ -232,9 +242,11 @@ The XML is one line; indented here:
 ### DownloadMultipleFile (`0x10`): file contents
 
 From the decompiled `THMGBServer handleDownloadMultipleFile:` and the command
-classes' `initFromData`/`encodeData`; verified live from Linux. Fields are in
-the requester's byte order (little-endian from Linux, see
-[Layer 4](#layer-4-commands)); replies are big-endian.
+classes' `initFromData`/`encodeData`; verified live in both directions. Every
+field is in the sender's byte order and read by the receiver according to the
+sender's OS (see [Layer 4](#layer-4-commands)): the Mac sends big-endian
+whether it requests or serves, and reads a Linux peer's request and replies
+little-endian.
 
 Request, requester → server:
 
@@ -243,7 +255,10 @@ Request, requester → server:
 ```
 
 A non-Linux sender appends `<destLen u16> <dest>` per file; the Mac decodes
-it only when the remote is a Mac.
+it only when the remote is a Mac. Requesting from a Linux peer, the Mac sends
+no destination, ends each path with a UTF-16 NUL (counted in `pathLen`), and
+numbers the files from `multiSessionID` up (session 104: file IDs 104 and
+105). Its session IDs counted 101, 102, … across requests in one daemon run.
 
 Replies, server → requester, in order:
 
@@ -264,6 +279,15 @@ remaining files nor `0xa7`. Other IDs from the decompile, not seen live:
 `0x0b` DownloadFile has a class but is not in `commandClassForCommandID:`, so
 the Mac cannot receive it.
 
+Serving from Linux (`--offer`), little-endian replies in the order above
+were accepted: the Mac logs `Client commandID: A1`, `ResponseResult(0xa1)
+{_RequestCommand:16, _RequestResult:0, …}`, `A3`, `A7`, `multi download
+finish: <session>` and `[Download]Did download N files`. After an `0xa9` it
+keeps the files that arrived, logs `Did download 1 files` and drops the
+session; no dialog appears. A request left unanswered gets no timeout,
+error or dialog in the 4 minutes watched; the next paste starts a new
+session.
+
 ## Linux peer: `tools/upipe_peer.py`
 
 Stdlib only (SG_IO via ctypes). `/dev/sgN` must be the cable's generic node
@@ -279,6 +303,8 @@ python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --second
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 20 --login linux-peer --clipboard "hello"
 # Fetch a file from the Mac (absolute path on the Mac); saved as RUN/download_1.bin
 python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 30 --login linux-peer --download "/Users/<user>/file.bin"
+# Put local files on the Mac's clipboard and serve them when pasted in Finder
+python3 tools/upipe_peer.py /dev/sg1 --out ~/wormhole-private/upipe/RUN --seconds 90 --login linux-peer --offer ./a.bin --offer ./b.bin
 python3 -m unittest tools.test_upipe_peer
 ```
 
@@ -286,7 +312,9 @@ Output: one `pkt_NNNN.bin` per fetched packet and `upipe_peer.jsonl`
 (`state`, `packet`, `command`, `queue`, `sent` records), plus
 `download_<fileID>.bin` per `--download`. With `--download` the tool stops as
 soon as `0xa7` or `0xa9` arrives. `--endian big` sends the request
-big-endian; it exists only to reproduce the crash below.
+big-endian; it exists only to reproduce the crash below. `--offer` serves
+only the offered files (anything else gets `0xa9`, code 6), re-reading each
+file when the request arrives, and exits once a request is answered.
 
 Mac-side tracing uses `tools/gobridge_scsi.d` (dtrace on GoBridgeDemon's
 `SCSITaskClass` calls; usage in the script header). It needs root, so it
@@ -306,6 +334,10 @@ Linux desktop ↔ MacBook (OS X 10.6.8, GoBridgeDemon 152311cb…), cable on bus
 | `dl` (`--download`, big-endian request) | The Mac's GoBridgeDemon threw an uncaught `NSRangeException` (`subdataWithRange: range {12, 23040} exceeds data length 102`): 23040 is `0x5A00`, our big-endian path length `0x005A` read little-endian. Wormhole.app relaunched the daemon (new PID), which sent Login again |
 | `dl…le` (`--download`, little-endian request) | Mac logs `remote is linux`, `sever will handle command: DownloadMultipleFile(0x10)`, `Send command: A3`, `setAttribute: 0`, `Send command: A7`. Linux receives ResponseResult (34 bytes, session 1), one 300 017-byte `0xa3` (file 1, index 1 of 1) and `0xa7`. The saved 300 000-byte file's SHA-256 matches the Mac's random test file |
 | `dl…big` (`--download`, 20 MiB random file) | Three `0xa3` pieces (8 MiB, 8 MiB, 4 MiB; `totalCount` 3, `currentIndex` 1–3), then `0xa7`. About 1.3 s from the request's ResponseResult to `0xa7` (~16 MB/s). SHA-256 matches |
+| `offer` (`--offer`, no serving yet) | Finder paste on the Mac (AppleScript `keystroke "v"` over ssh) leads to a 171-byte big-endian `0x10` (session 101, file ID 101, the offered path plus a NUL, no destination). The Mac then logs `The dummy file has not yet been copied, wait a moment...` 7 times at 0.5 s intervals (`nTimeout` 0–6, the same on every later paste, served or not) and nothing more for session 101 |
+| `serve` (`--offer`, Mac-style `/\…` path) | ResponseResult, one 300 017-byte `0xa3`, `0xa7`, all little-endian; the Mac logs `multi download finish: 102`. The pasted file's SHA-256 matches, but its name is the whole `\home\…\wh_serve_test.bin` path |
+| `serve…big` (`--offer`, POSIX path, 20 MiB random file) | Named `wh_big.bin`. Three `0xa3` (8, 8, 4 MiB), `0xa7`; 338 sends, none failed, about 1.1 s from the request to the last send (~18 MB/s). SHA-256 matches |
+| `serve…err` (`--offer` two files, the second deleted before the paste) | One 315-byte `0x10` for both (session 104, file IDs 104/105). ResponseResult, `0xa3` for the first, `0xa9` (code 6) for the second. The Mac keeps the first file (SHA-256 matches), logs `Did download 1 files`, removes the session; no dialog |
 | `dl…missing` (`--download` missing file, then an existing one) | ResponseResult, then a 65-byte `0xa9` (session 1, code 6, file 1, `Read file data error`). Mac logs `… does not exist!!!`, `Send command: A9`. The second file was not sent and no `0xa7` followed. No crash (same daemon PID) |
 
 The `macpeer` usbmon capture, filtered to `5:111` with
@@ -325,7 +357,10 @@ because they contain the Mac's host name.
   Mac abandoned the drag).
 - The `MultipleFilePackage` ID (`TX_MULTIPLE_FILE_PACKAGE`) and when the
   Mac uses it; other `0xa9` error codes.
-- The Mac as requester: serving `0x10` from Linux, and uploads (`0x11`…).
+- Uploads and file operations (`0x11`…, `handleUploadFileData`, rename,
+  delete, mkdir): what triggers them from the Mac.
+- `0xa6` (zero-length file) and `0xa5`/`0xab`: `--offer` sends an empty file
+  as one empty `0xa3`, which is not verified live.
 - Image clipboard formats (only text and file seen).
 - `--os windows` to get `forwardDomainFoldersInfoToRemote` traffic.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.

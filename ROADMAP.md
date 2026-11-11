@@ -48,11 +48,11 @@ The HID injection path (`0xD9` CDB, types `'3'`/`'4'`/`'6'`) is decoded and veri
 - [x] Capture live peer-active session with clipboard copy and file transfer — Linux ↔ macOS, 2026-11-11, with `tools/upipe_peer.py` on Linux and `tools/gobridge_scsi.d` (dtrace) on the Mac. No usbmon capture of it is published: the Login packet carries the Mac's host name (#7)
 - [x] Identify UPipe CDB magic byte(s) — `0xD8` poll, `0xD9 0x28` fetch, `0xD9 0x2A` send
 - [ ] Decode UPipe framing and commands — packet tail, chunk header, terminator, Login (`0x01`), ResponseResult (`0xa1`), clipboard XmlPacket (`0x39`: text and file metadata) and file download (`0x10` → `0xa1`/`0xa3`/`0xa7`, `0xa9` on error) decoded; upload, rename, delete and mkdir (`0x11`…), image clipboard formats and `MultipleFilePackage` open (#9)
-- [ ] Verify bidirectional symmetry (PC A → PC B vs PC B → PC A) — clipboard text verified both ways; file download verified Mac → Linux only
+- [x] Verify bidirectional symmetry (PC A → PC B vs PC B → PC A) — clipboard text and file clipboard + download verified both ways; the Mac pastes files served by `tools/upipe_peer.py --offer` (SHA-256 checked up to 20 MiB, and the `0xa9` error path) (#9)
 - [x] `tools/wormhole_parse.py` decodes UPipe: poll state, chunk headers and the reassembled commands, reusing the `tools/upipe_peer.py` decoders (#8)
 - [x] Document in `docs/transport.md` (new section) + new `docs/upipe-protocol.md`
 
-**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`) and file download from the Mac (`--download`). `tools/wormhole_parse.py` decodes UPipe in usbmon captures. Remaining: the Mac fetching files from Linux, and uploads.
+**Status:** `tools/upipe_peer.py` acts as a GoBridge peer on Linux: login, clipboard text push (`--clipboard`), file download from the Mac (`--download`) and serving files the Mac pastes (`--offer`). `tools/wormhole_parse.py` decodes UPipe in usbmon captures. Remaining: uploads and file operations.
 
 ---
 
@@ -106,7 +106,7 @@ Host-side observations resolved several firmware-adjacent questions without need
 | v0.1 | Enumeration & topology | ✅ Done | — |
 | v0.2 | SCSI / Mass Storage | ✅ Done | — |
 | v0.3 | ISO payload & host inventory | ✅ Done | — |
-| v0.4 | **UPipe protocol** | 🔄 **In progress** | Uploads, Mac → Linux fetch |
+| v0.4 | **UPipe protocol** | 🔄 **In progress** | Uploads and file operations |
 | v0.5 | Windows host parity | 🔄 In progress | After v0.4 |
 | v0.6 | Firmware internals | 🔄 Partially resolved | Long-term |
 | v1.0 | Stable reference release | 📋 Planned | When v0.4–0.6 converge |
@@ -117,8 +117,7 @@ Host-side observations resolved several firmware-adjacent questions without need
 
 The capture method is in `docs/upipe-protocol.md` (Linux peer tool + Mac dtrace tracer). Remaining steps:
 
-1. Serve `0x10` DownloadMultipleFile from Linux: push a `CB_Format_File` clipboard entry to the Mac, paste in Finder, and answer the Mac's request.
-2. Decode the upload and file-operation commands (`0x11`…) the same way: decompile, add to `tools/upipe_peer.py`, verify live.
-3. Repeat against a Windows peer for parity (v0.5).
+1. Decode the upload and file-operation commands (`0x11`…): find what makes the Mac send them, decompile, add to `tools/upipe_peer.py`, verify live.
+2. Repeat against a Windows peer for parity (v0.5).
 
 Once uploads are done, v0.4 closes.

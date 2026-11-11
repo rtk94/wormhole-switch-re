@@ -9,7 +9,9 @@ Without --login the tool is receive-only: it sends only the status poll and
 the fetch command.  With --login NAME it also answers the peer's LoginCommand
 with a ResponseResult and logs in to the peer under NAME, which is what the
 GoBridge daemon waits for before going any further.  --clipboard TEXT then
-pushes TEXT to the peer's clipboard as a Cmd_Transfer_Clipboard XmlPacket.
+pushes TEXT to the peer's clipboard as a Cmd_Transfer_Clipboard XmlPacket,
+--download PATH fetches a file from the peer, and --offer FILE puts a local
+file on the peer's clipboard and serves it when it is pasted there.
 
 Layers (decompiled from macOS OTiTransfer + GoBridgeDemon; see
 docs/upipe-protocol.md):
@@ -33,6 +35,7 @@ Usage:
   python3 tools/upipe_peer.py /dev/sgN --out ~/wormhole-private/upipe/RUN --seconds 60
   python3 tools/upipe_peer.py /dev/sgN --out ... --login linux-peer
   python3 tools/upipe_peer.py /dev/sgN --out ... --login linux-peer --clipboard "hello"
+  python3 tools/upipe_peer.py /dev/sgN --out ... --login linux-peer --offer ./file.bin
 """
 
 import argparse
@@ -246,7 +249,8 @@ def decode_login(cmd):
             "name": cmd[5:5 + n].decode("utf-8", "replace")}
 
 
-def encode_response(request_command, result=0, os_byte=None, session_id=0, error_code=0):
+def encode_response(request_command, result=0, os_byte=None, session_id=0, error_code=0,
+                    endian=">"):
     """ResponseResult.encodeData (big-endian fields, as the Mac encodes them).
 
     With os_byte set, extraInfoFlag = 3 and extraInfo = b"OSVERSION" + os
@@ -257,17 +261,17 @@ def encode_response(request_command, result=0, os_byte=None, session_id=0, error
     if os_byte is not None:
         extra, flag = b"OSVERSION" + bytes([os_byte]), 3
     return (bytes([CMD_RESPONSE, request_command, result])
-            + struct.pack(">IIII", session_id, error_code, 0, 0)
-            + bytes([flag]) + struct.pack(">I", 0 if flag == 3 else len(extra)) + extra
-            + bytes(6) + struct.pack(">I", 0))
+            + struct.pack(endian + "IIII", session_id, error_code, 0, 0)
+            + bytes([flag]) + struct.pack(endian + "I", 0 if flag == 3 else len(extra)) + extra
+            + bytes(6) + struct.pack(endian + "I", 0))
 
 
-def decode_response(cmd):
+def decode_response(cmd, endian=">"):
     if len(cmd) < 24 or cmd[0] != CMD_RESPONSE:
         raise ValueError("not a ResponseResult")
     out = {"request_command": cmd[1], "result": cmd[2],
-           "session_id": struct.unpack(">I", cmd[3:7])[0],
-           "error_code": struct.unpack(">I", cmd[7:11])[0],
+           "session_id": struct.unpack(endian + "I", cmd[3:7])[0],
+           "error_code": struct.unpack(endian + "I", cmd[7:11])[0],
            "extra_flag": cmd[19]}
     if cmd[19] == 3 and cmd[24:33] == b"OSVERSION":
         out["os"] = cmd[33]
@@ -306,6 +310,62 @@ def encode_clipboard_text(text):
     return encode_xml_packet(CLIPBOARD_XML.format(body=body))
 
 
+NODE_INFO_LEN = 824
+NODE_PATH_LEN = 260                 # MAX_PATH; 8-bit at 0, UTF-16LE (520 bytes) at 260
+NODE_TAIL = struct.Struct("<QQQII")  # creation, last access, last write, size high, size low
+FILETIME_UNIX_EPOCH = 116444736000000000
+
+
+def filetime_from_unix(t):
+    """Windows FILETIME (100 ns ticks since 1601) for a Unix timestamp."""
+    return FILETIME_UNIX_EPOCH + int(round(t * 10 ** 7))
+
+
+def encode_node_info(path, size, ctime, atime, mtime):
+    """One CB_Format_File NodeInfo record (824 bytes, little-endian).
+
+    Times are FILETIMEs (creation, last access, last write).  Bytes 812-823
+    were zero in the Mac's record; their meaning is unconfirmed.
+    """
+    raw8, raw16 = path.encode("utf-8"), path.encode("utf-16le")
+    if len(raw8) >= NODE_PATH_LEN or len(raw16) >= 2 * NODE_PATH_LEN:
+        raise ValueError("path longer than MAX_PATH")
+    return (raw8.ljust(NODE_PATH_LEN, b"\0") + raw16.ljust(2 * NODE_PATH_LEN, b"\0")
+            + NODE_TAIL.pack(ctime, atime, mtime, size >> 32, size & 0xFFFFFFFF)
+            + bytes(NODE_INFO_LEN - 3 * NODE_PATH_LEN - NODE_TAIL.size))
+
+
+def decode_node_info(rec):
+    if len(rec) != NODE_INFO_LEN:
+        raise ValueError("NodeInfo is %d bytes, expected %d" % (len(rec), NODE_INFO_LEN))
+    ctime, atime, mtime, hi, lo = NODE_TAIL.unpack_from(rec, 3 * NODE_PATH_LEN)
+    path = rec[NODE_PATH_LEN:3 * NODE_PATH_LEN].decode("utf-16le").split("\0", 1)[0]
+    return {"path": path, "size": (hi << 32) | lo, "ctime": ctime, "atime": atime,
+            "mtime": mtime}
+
+
+def node_info_for_file(path):
+    """NodeInfo for a local file under its absolute POSIX path.
+
+    The Mac writes its own paths as /\\Users\\x, but it names a pasted
+    file after the part behind the last '/', so a Linux peer must send the
+    plain path.  The Mac asks for the file by the same path.  Linux has no
+    portable creation time, so the last-write time stands in.
+    """
+    st = os.stat(path)
+    return encode_node_info(os.path.abspath(path), st.st_size,
+                            filetime_from_unix(st.st_mtime), filetime_from_unix(st.st_atime),
+                            filetime_from_unix(st.st_mtime))
+
+
+def encode_clipboard_files(nodes):
+    """Cmd_Transfer_Clipboard XmlPacket offering files (CB_Format_File)."""
+    lines = "".join("<Line><NodeInfo>%s</NodeInfo></Line>" % n.hex().upper() for n in nodes)
+    body = ("<NodeInfoList>%s</NodeInfoList><CB_Format_Type>CB_Format_File</CB_Format_Type>"
+            % lines)
+    return encode_xml_packet(CLIPBOARD_XML.format(body=body))
+
+
 def _tag(xml, name):
     start, end = "<%s>" % name, "</%s>" % name
     i = xml.find(start)
@@ -324,6 +384,18 @@ def decode_clipboard(xml):
             out["text_error"] = str(e)
     if "<NodeInfo>" in xml:
         out["files"] = xml.count("<NodeInfo>")
+        nodes, pos = [], 0
+        while True:
+            i = xml.find("<NodeInfo>", pos)
+            j = xml.find("</NodeInfo>", i)
+            if i < 0 or j < 0:
+                break
+            try:
+                nodes.append(decode_node_info(bytes.fromhex(xml[i + 10:j])))
+            except ValueError as e:
+                nodes.append({"decode_error": str(e)})
+            pos = j
+        out["nodes"] = nodes
     return out
 
 
@@ -346,11 +418,86 @@ def encode_download_request(multi_session_id, files, endian="<"):
     return out
 
 
-def decode_file_data(cmd):
+def decode_download_request(cmd, endian=">"):
+    """DownloadMultipleFile (0x10) in the requester's byte order.
+
+    The Mac sends it big-endian with a NUL-terminated UTF-16BE path and,
+    to a Linux peer, no destination field.  The trailing NUL is stripped.
+    """
+    if len(cmd) < 7 or cmd[0] != CMD_DOWNLOAD_MULTI:
+        raise ValueError("not a DownloadMultipleFile")
+    utf16 = "utf-16-be" if endian == ">" else "utf-16-le"
+    multi, count = struct.unpack(endian + "IH", cmd[1:7])
+    files, off = [], 7
+    for _ in range(count):
+        if off + 6 > len(cmd):
+            raise ValueError("DownloadMultipleFile truncated")
+        file_id, n = struct.unpack(endian + "IH", cmd[off:off + 6])
+        off += 6
+        if off + n > len(cmd):
+            raise ValueError("DownloadMultipleFile path truncated")
+        path = cmd[off:off + n].decode(utf16).rstrip("\0")
+        off += n
+        files.append({"file_id": file_id, "path": path})
+    return {"multi_session_id": multi, "files": files}
+
+
+def encode_file_data(file_id, total, index, data, endian="<"):
+    """DownloadFileData (0xA3) piece; index counts from 1."""
+    return (bytes([CMD_FILE_DATA]) + struct.pack(endian + "IIII", file_id, total, index, len(data))
+            + data)
+
+
+def encode_download_finished(multi_session_id, endian="<"):
+    return bytes([CMD_DOWNLOAD_FINISHED]) + struct.pack(endian + "I", multi_session_id)
+
+
+def encode_upload_error(session_id, code, file_id, error, endian="<"):
+    """UploadMultiFileError (0xA9); see decode_upload_error for the layout."""
+    raw = (error + "\0").encode("utf-16-be" if endian == ">" else "utf-16-le")
+    return (bytes([CMD_UPLOAD_ERROR]) + struct.pack(endian + "III", session_id, code, file_id)
+            + bytes(6) + struct.pack(endian + "I", len(raw)) + raw)
+
+
+MAX_FILE_PIECE = 0x800000           # the Mac sends at most 8 MiB per 0xA3
+READ_FILE_ERROR = 6                 # "Read file data error", as the Mac reports a missing file
+
+
+def serve_download(cmd, offered, endian="<", piece=MAX_FILE_PIECE, request_endian=">"):
+    """Answer a peer's DownloadMultipleFile the way THMGBServer does.
+
+    offered maps the peer-side path we put on its clipboard to the local
+    file; nothing else is served.  Replies: ResponseResult, then 0xA3
+    pieces per file and 0xA7, or 0xA9 at the first file that cannot be
+    read (the Mac then sends nothing more for the request).
+    """
+    req = decode_download_request(cmd, request_endian)
+    multi = req["multi_session_id"]
+    out = [encode_response(CMD_DOWNLOAD_MULTI, 0, session_id=multi, endian=endian)]
+    for f in req["files"]:
+        local = offered.get(f["path"])
+        try:
+            if local is None:
+                raise OSError("not offered")
+            with open(local, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            out.append(encode_upload_error(multi, READ_FILE_ERROR, f["file_id"],
+                                           "Read file data error", endian))
+            return out
+        total = max(1, -(-len(data) // piece))
+        for i in range(total):
+            out.append(encode_file_data(f["file_id"], total, i + 1,
+                                        data[i * piece:(i + 1) * piece], endian))
+    out.append(encode_download_finished(multi, endian))
+    return out
+
+
+def decode_file_data(cmd, endian=">"):
     """DownloadFileData (0xA3): a3 <sessionFileID> <totalCount> <index> <dataLength> <data>."""
     if len(cmd) < FILE_DATA_HEADER or cmd[0] != CMD_FILE_DATA:
         raise ValueError("not a DownloadFileData")
-    file_id, total, index, length = struct.unpack(">IIII", cmd[1:FILE_DATA_HEADER])
+    file_id, total, index, length = struct.unpack(endian + "IIII", cmd[1:FILE_DATA_HEADER])
     data = cmd[FILE_DATA_HEADER:FILE_DATA_HEADER + length]
     if len(data) != length:
         raise ValueError("DownloadFileData truncated: %d of %d bytes" % (len(data), length))
@@ -358,7 +505,7 @@ def decode_file_data(cmd):
             "data": data}
 
 
-def decode_upload_error(cmd):
+def decode_upload_error(cmd, endian=">"):
     """UploadMultiFileError (0xA9), big-endian; the Mac sends it for a missing
     file and ends the whole request (no further files, no 0xA7):
     a9 <sessionID u32> <errorCode u32> <errorFileID u32> <tag 6 B>
@@ -366,16 +513,22 @@ def decode_upload_error(cmd):
     """
     if len(cmd) < 23 or cmd[0] != CMD_UPLOAD_ERROR:
         raise ValueError("not an UploadMultiFileError")
-    session_id, code, file_id = struct.unpack(">III", cmd[1:13])
-    (length,) = struct.unpack(">I", cmd[19:23])
+    session_id, code, file_id = struct.unpack(endian + "III", cmd[1:13])
+    (length,) = struct.unpack(endian + "I", cmd[19:23])
     raw = cmd[23:23 + length]
     if len(raw) != length:
         raise ValueError("UploadMultiFileError string truncated")
     return {"session_id": session_id, "error_code": code, "file_id": file_id,
-            "tag": cmd[13:19].hex(), "error": raw.decode("utf-16-be").rstrip("\0")}
+            "tag": cmd[13:19].hex(),
+            "error": raw.decode("utf-16-be" if endian == ">" else "utf-16-le").rstrip("\0")}
 
 
-def describe_command(cmd):
+def describe_command(cmd, endian=">"):
+    """Decode a command for logging.
+
+    endian is the sender's byte order: the Mac's commands are big-endian,
+    the replies this tool sends to the Mac little-endian.
+    """
     if not cmd:
         return {"command": None}
     out = {"command": cmd[0], "command_name": COMMANDS.get(cmd[0], "unknown"), "len": len(cmd)}
@@ -383,19 +536,38 @@ def describe_command(cmd):
         if cmd[0] == CMD_LOGIN:
             out.update(decode_login(cmd))
         elif cmd[0] == CMD_RESPONSE:
-            out.update(decode_response(cmd))
+            out.update(decode_response(cmd, endian))
         elif cmd[0] == CMD_XML:
             out.update(decode_clipboard(decode_xml_packet(cmd)))
         elif cmd[0] == CMD_FILE_DATA:
-            d = decode_file_data(cmd)
+            d = decode_file_data(cmd, endian)
             d.pop("data")
             out.update(d)
         elif cmd[0] == CMD_DOWNLOAD_FINISHED and len(cmd) >= 5:
-            out["session_id"] = struct.unpack(">I", cmd[1:5])[0]
+            out["session_id"] = struct.unpack(endian + "I", cmd[1:5])[0]
         elif cmd[0] == CMD_UPLOAD_ERROR:
-            out.update(decode_upload_error(cmd))
+            out.update(decode_upload_error(cmd, endian))
+        elif cmd[0] == CMD_DOWNLOAD_MULTI:
+            other = "<" if endian == ">" else ">"
+            try:                        # the Mac sends big-endian, Linux little
+                out.update(decode_download_request(cmd, endian))
+            except (ValueError, UnicodeDecodeError):
+                out.update(decode_download_request(cmd, other))
     except ValueError as e:
         out["decode_error"] = str(e)
+    return out
+
+
+def after_login_commands(clipboard=None, offer=None, download=None, endian="<"):
+    """Commands to queue once the peer accepts our Login, as (command, why)."""
+    out = []
+    if clipboard is not None:
+        out.append((encode_clipboard_text(clipboard), "clipboard"))
+    if offer:
+        out.append((encode_clipboard_files([node_info_for_file(p) for p in offer]), "offer"))
+    if download:
+        out.append((encode_download_request(1, list(enumerate(download, start=1)), endian),
+                    "download"))
     return out
 
 
@@ -450,6 +622,11 @@ def main(argv):
                     help="OS type to announce with --login (default linux)")
     ap.add_argument("--clipboard", metavar="TEXT",
                     help="with --login: push TEXT to the peer's clipboard once logged in")
+    ap.add_argument("--offer", metavar="LOCAL_PATH", action="append",
+                    help="with --login: put this local file on the peer's clipboard "
+                         "(CB_Format_File, repeatable) and serve it when the peer pastes "
+                         "it; only offered files are served; exits once a request is "
+                         "answered")
     ap.add_argument("--download", metavar="PEER_PATH", action="append",
                     help="with --login: ask the peer to send this file (repeatable); "
                          "saved as download_<n>.bin in --out; exits when the peer "
@@ -458,8 +635,8 @@ def main(argv):
                     help="byte order for --download fields (default little: the Mac decodes "
                          "a Linux peer little-endian; big crashed its daemon)")
     args = ap.parse_args(argv)
-    if (args.clipboard is not None or args.download) and not args.login:
-        ap.error("--clipboard and --download need --login")
+    if (args.clipboard is not None or args.download or args.offer) and not args.login:
+        ap.error("--clipboard, --offer and --download need --login")
     os_byte = {v: k for k, v in OS_NAMES.items()}[args.os]
 
     os.makedirs(args.out, exist_ok=True)
@@ -476,17 +653,21 @@ def main(argv):
     after_login_sent = False
     endian = ">" if args.endian == "big" else "<"
     started = set()                     # file IDs whose download file we have opened
+    # Paths as the peer will ask for them -> local files; only these are served.
+    offered = {os.path.abspath(p): os.path.abspath(p) for p in args.offer or []}
+    served = False                      # answered a DownloadMultipleFile with 0xA7/0xA9
     download_done = False               # 0xA7 or 0xA9 received: stop once txq drains
     end = time.time() + args.seconds
     last_state, n_rx, n_tx = None, 0, 0
     emit({"event": "start", "dev": args.dev, "fetch_cdb": fetch.hex(), "send_cdb": send.hex(),
           "login": args.login, "os": os_byte if args.login else None})
 
-    def queue(cmd, why):
+    def queue(cmd, why, cmd_endian=">"):
         pkts = framer.frame(cmd)
         txq.extend(pkts)
-        emit({"event": "queue", "why": why, "packets": len(pkts), **describe_command(cmd),
-              "cmd_hex": cmd.hex()})
+        emit({"event": "queue", "why": why, "packets": len(pkts),
+              **describe_command(cmd, cmd_endian),
+              "cmd_hex": cmd[:4096].hex()})
         print("queue", why, len(pkts), "packets", cmd[:24].hex(), flush=True)
 
     # Log in straight away: a peer that still thinks we are logged in from an
@@ -536,11 +717,9 @@ def main(argv):
                     # The peer's ResponseResult to our Login = we are logged in.
                     if cmd[:2] == bytes([CMD_RESPONSE, CMD_LOGIN]) and not after_login_sent:
                         after_login_sent = True
-                        if args.clipboard is not None:
-                            queue(encode_clipboard_text(args.clipboard), "clipboard")
-                        if args.download:
-                            files = list(enumerate(args.download, start=1))
-                            queue(encode_download_request(1, files, endian), "download")
+                        for c, why in after_login_commands(args.clipboard, args.offer,
+                                                           args.download, endian):
+                            queue(c, why)
                     if cmd[:1] == bytes([CMD_FILE_DATA]) and "decode_error" not in desc:
                         piece = decode_file_data(cmd)
                         path = os.path.join(args.out, "download_%d.bin" % piece["file_id"])
@@ -548,6 +727,10 @@ def main(argv):
                         with open(path, "ab" if piece["file_id"] in started else "wb") as f:
                             f.write(piece["data"])
                         started.add(piece["file_id"])
+                    if offered and cmd[:1] == bytes([CMD_DOWNLOAD_MULTI]):
+                        for reply in serve_download(cmd, offered):
+                            queue(reply, "serve", "<")
+                        served = True
                     if args.download and cmd[:1] in (bytes([CMD_DOWNLOAD_FINISHED]),
                                                      bytes([CMD_UPLOAD_ERROR])):
                         download_done = True
@@ -562,7 +745,8 @@ def main(argv):
                 if not ok:
                     break
                 txq.pop(0)
-            if download_done and not txq:
+            # Stop once the request we were waiting for is answered and sent.
+            if not txq and (served if offered else download_done):
                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:
