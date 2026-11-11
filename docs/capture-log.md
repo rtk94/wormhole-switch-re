@@ -47,7 +47,7 @@ Example transaction pair (≈ every 2 s when idle):
 ```
 10:58:44.466581 USB BULK SUBMIT to 3:15:2
   55 53 42 43 F1 01 00 00 08 00 00 00 80 00 0A 4A 01 00 00 10 00 00 00 08 00
-  = USBC CBW Tag 0x01F1, len 8, IN, LUN 0, CDB 10 B: 4A LOG SENSE
+  = USBC CBW Tag 0x01F1, len 8, IN, LUN 0, CDB 10 B: 4A GET EVENT STATUS NOTIFICATION
 10:58:44.467259 USB BULK COMPLETE from 3:15:1
   55 53 42 53 F1 01 00 00 00 00 00 00 01
   = USBS CSW Tag 0x01F1, residue 0, status 0x01 (CHECK CONDITION)
@@ -63,7 +63,7 @@ Example transaction pair (≈ every 2 s when idle):
   = USBS status 0x00 (good)
 ```
 
-Same pair repeats with incrementing tags (`F3/F4`, `F5/F6`, …) every ≤2 s — kernel LOG SENSE polling against unsupported opcode.
+Same pair repeats with incrementing tags (`F3/F4`, `F5/F6`, …) every ≤2 s — kernel GET EVENT STATUS NOTIFICATION polling against unsupported opcode.
 
 ## SCSI opcode histogram (parsed CBWs, 98 total on Bus 3)
 
@@ -76,10 +76,10 @@ Mixed Bus 3 traffic (Wormhole 3:15 + IronKey 3:14 + others). Wormhole-only tags 
 0x25 READ CAPACITY(10): 1
 0x43 READ TOC/PMA/ATIP: 2
 0x46 GET CONFIGURATION: 1
-0x4A LOG SENSE: 30
+0x4A GET EVENT STATUS NOTIFICATION: 30
 ```
 
-Wormhole-specific in this window (`tools/wormhole_parse.py`): LOG SENSE (16) + REQUEST SENSE (16) loop, plus the single INQUIRY (2, standard + EVPD) + READ CAPACITY(10) (1) pair driven by `sg_inq`/`sg_readcap` + `dd` at 10:58:44-46, TEST UNIT READY (4), and the kernel's CD-ROM probes READ TOC/PMA/ATIP (2, `43 00…` / `43 02…`) and GET CONFIGURATION (1, `46 00…`) at frames 1385-1402. IronKey 3:14 accounts for the remaining TEST UNIT READY (14), REQUEST SENSE (28) and LOG SENSE (14); it issues no `0x43`/`0x46` in this window.
+Wormhole-specific in this window (`tools/wormhole_parse.py`): GET EVENT STATUS NOTIFICATION (16) + REQUEST SENSE (16) loop, plus the single INQUIRY (2, standard + EVPD) + READ CAPACITY(10) (1) pair driven by `sg_inq`/`sg_readcap` + `dd` at 10:58:44-46, TEST UNIT READY (4), and the kernel's CD-ROM probes READ TOC/PMA/ATIP (2, `43 00…` / `43 02…`) and GET CONFIGURATION (1, `46 00…`) at frames 1385-1402. IronKey 3:14 accounts for the remaining TEST UNIT READY (14), REQUEST SENSE (28) and GET EVENT STATUS NOTIFICATION (14); it issues no `0x43`/`0x46` in this window.
 
 READ CAPACITY(16) (`0x9E`) failed live (`sg_readcap --16` → Invalid opcode) — not emitted by the kernel in this window because the Linux `sr` driver sizes the disc with READ CAPACITY(10) plus `cdrom_get_last_written()` and does not issue READ CAPACITY(16) (see `docs/capacity-anomaly.md`). The live `sg_raw` READ CAPACITY(10) response (`00 00 06 38 00 00 08 00`) matches `sg_readcap`.
 
@@ -109,7 +109,7 @@ python3 -m unittest tools.test_wormhole_parse
 
 It discovers the Wormhole by VID:PID (`0711:2211`) from control
 enumeration rather than a hard-coded Bus:Device, pairs CBW → data →
-CSW per device (42 Wormhole transactions: LOG SENSE 16, REQUEST SENSE
+CSW per device (42 Wormhole transactions: GET EVENT STATUS NOTIFICATION 16, REQUEST SENSE
 16, TEST UNIT READY 4, INQUIRY 2, READ CAPACITY(10) 1, READ
 TOC/PMA/ATIP 2, GET CONFIGURATION 1), and confirms 0 interrupt
 packets for 3:15 (all 1682 interrupt packets are Logitech 3:7).
@@ -146,13 +146,13 @@ after filtering to the Wormhole device, 1.50 s, SHA-256 `d20171795fa69a36a376f2c
 plus `wormhole_bus3_synth_capinfos.txt`):
 
 ```
-Vendor HID (0xD9) packets: 1  candidate UPipe: 0  HID reports: 0
+Vendor HID (0xD9) packets: 1  UPipe: poll 0 / fetch 0 / send 0  other vendor CDBs: 0  HID reports: 0
 3:15 row: ... 3  1  0  <-- WormholeSwitch
   f7   WORMHOLE VENDOR HID (0xD9)  CDB=d933010a000000000000000000004f54
       dir=OUT len=0  CSW=good
       vendorHID type=mouse payload=010a00000000000000000000
       footer_ok=True framing=True
-  (next two transactions are the usual LOG SENSE / REQUEST SENSE pair)
+  (next two transactions are the usual GET EVENT STATUS NOTIFICATION / REQUEST SENSE pair)
 HID interrupt reports (0 in focus): interfaces idle
 ```
 

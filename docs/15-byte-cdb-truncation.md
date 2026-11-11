@@ -117,7 +117,7 @@ the CBW was built.
 ## Correlation checks
 
 - Opcode: only `0xD9` ever varies. Across all captures,
-  `REQUEST SENSE` is always 6 bytes (451 cases), `LOG SENSE` always
+  `REQUEST SENSE` is always 6 bytes (451 cases), `GET EVENT STATUS NOTIFICATION` (`0x4A`) always
   10 (429), kernel `TEST UNIT READY` / `INQUIRY` etc. always 6 or
   10. No non-`0xD9` CDB is ever short. Shortness is specific to the
   hand-built vendor CDBs.

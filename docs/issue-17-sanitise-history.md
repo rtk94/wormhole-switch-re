@@ -21,7 +21,7 @@
   SHA-256 `5a135f4dc9df9cd69bcd4f3829a48a5232e6d2e1523bafb4a592905c2962b25b`
   (original `fff7d587…`). `captures/wormhole_bus3_capinfos.txt` regenerated.
 - Verified with `tools/wormhole_parse.py`: all **42 Wormhole SCSI transactions preserved**
-  (LOG SENSE 16, REQUEST SENSE 16, TEST UNIT READY 4, INQUIRY 2, READ CAPACITY(10) 1,
+  (GET EVENT STATUS NOTIFICATION 16, REQUEST SENSE 16, TEST UNIT READY 4, INQUIRY 2, READ CAPACITY(10) 1,
   READ TOC/PMA/ATIP 2, GET CONFIGURATION 1), 0 interrupt packets for `3:15` — identical
   Wormhole rows to the unfiltered parse. Only the non-Wormhole devices were dropped.
 - Impact: frame numbers shift (e.g. first Wormhole CBW `f97 → f7`); `docs/capture-log.md`

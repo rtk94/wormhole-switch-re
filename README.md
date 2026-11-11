@@ -27,7 +27,7 @@ When both ends are plugged into two PCs, each PC runs the bundled *Wormhole* / *
 | Layer | Detail |
 |---|---|
 | USB | USB 2.00, High-Speed 480M, self-powered, MaxPower 10mA, malformed `bmAttributes 0x60` (missing must-be-set bit 7). |
-| SCSI (If 0) | Standard Bulk-Only, Bulk-Only CBW (`USBC`) / CSW (`USBS`). INQUIRY returns PDT=5 (cd/dvd), version `0x00` (no conformance claimed), vendor `j5create`, product `WormholeSwitch`, rev `2.00`. Minimal command set: `TEST UNIT READY`, `INQUIRY`, `REQUEST SENSE`, `READ CAPACITY(10)`, `READ(10)`. `LOG SENSE (0x4A)` and `READ CAPACITY(16) (0x9E)` return CHECK CONDITION / INVALID OPCODE. |
+| SCSI (If 0) | Standard Bulk-Only, Bulk-Only CBW (`USBC`) / CSW (`USBS`). INQUIRY returns PDT=5 (cd/dvd), version `0x00` (no conformance claimed), vendor `j5create`, product `WormholeSwitch`, rev `2.00`. Minimal command set: `TEST UNIT READY`, `INQUIRY`, `REQUEST SENSE`, `READ CAPACITY(10)`, `READ(10)`. `GET EVENT STATUS NOTIFICATION (0x4A)` and `READ CAPACITY(16) (0x9E)` return CHECK CONDITION / INVALID OPCODE. |
 | Capacity anomaly | `READ CAPACITY(10)` returns last LBA 1592 / 2048 B blocks (3.1 MiB), which is the usable size of the ISO9660 volume labelled `WORMHOLE`. Linux exposes `/dev/srX` as 31744×512 B (15.5 MiB) because `sr` takes `max(READ CAPACITY, last_written)` and the firmware's track information reports 7936 blocks. See `docs/capacity-anomaly.md`. |
 | HID (If 1/2) | Boot Mouse (52 B report descriptor) and Boot Keyboard (67 B). Appear as `hidraw*` + input events. Idle until peer software injects reports — see `docs/transport.md`. |
 | ISO payload | `autorun.inf` → `SKLoader.exe` (embedded UPX DLL resource) + `Deployment/GSDD.lst`/`GSDD.zz`, macOS `Wormhole.app` → `WormholeShell` → `Wormhole.tgz` → `GoBridgeDemon` + `KMKeyMouse`/`KMClipboard`/`OTiTransfer`. See `docs/iso-payload.md` and `docs/pe-analysis.md`. |
@@ -110,10 +110,11 @@ It discovers the Wormhole by VID:PID during control enumeration, so it
 does not depend on a Bus:Device number from a previous plug.  It also
 decodes the Wormhole vendor HID protocol (16-byte `0xD9` CDB,
 `D9 '3'/'4'/'6' <12 payload> O T` — see `docs/transport.md`) and boot
-HID interrupt reports (EP3 mouse, EP4 keyboard), and flags any other
-vendor-range CDB as a candidate UPipe packet.  It does not decode UPipe
-yet (#8); the UPipe format and a Linux peer are in
-`docs/upipe-protocol.md`:
+HID interrupt reports (EP3 mouse, EP4 keyboard).  It decodes the UPipe
+peer channel too (`0xD8` poll, `0xD9 0x28`/`0x2A` 64 KiB packets) and
+lists the GoBridge commands reassembled from them; any other
+vendor-range CDB is flagged as a candidate.  The UPipe format and a
+Linux peer are in `docs/upipe-protocol.md`:
 
 ```sh
 python3 tools/wormhole_parse.py captures/wormhole_bus3_2026-11-06.pcap

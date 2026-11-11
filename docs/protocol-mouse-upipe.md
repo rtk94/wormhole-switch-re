@@ -315,7 +315,7 @@ Returns a dict with:
 | `payload` | List of 12 ints |
 | `footer_ok` | True if bytes 14–15 == `b"OT"` |
 | `valid_hid_framing` | All three checks pass (len==16, type known, footer OK) |
-| `candidate_upipe` | True for vendor opcodes ≠ 0xD9 |
+| `candidate_upipe` | True for vendor opcodes that are neither `0xD9` HID nor UPipe (`0xD8`, `0xD9 0x28`/`0x2A`, reported with `is_upipe`) |
 
 ### 4.3 `build_vendor_hid_cdb(hid_type, payload)` (lines 549–558)
 
