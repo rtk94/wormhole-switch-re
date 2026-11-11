@@ -229,7 +229,7 @@ The daemon's `THMFileManager` maps these to its `self+0x51`-style enable flags a
 
 ## 8. Unknowns / next steps
 
-- UPipe file/clipboard CDB magic (non-`0xD9` vendor opcode + payload header) — still needs a live peer-active capture (`docs/reproduction.md` §6; parser already flags `candidate_upipe`).
+- UPipe file/clipboard CDBs — resolved: `0xD8` poll plus `0xD9 0x28`/`0x2A` 64 KiB packets (`docs/upipe-protocol.md`), decoded by `tools/wormhole_parse.py`.
 - `NotifySettingDidChange:` enum names — require GoBridgeDemon `THMFileManager` decompile of the receiving switch.
 - `setProtocolForProxy:` protocol object (`DAT_0002f3fc`) — interface definition for the distributed-object protocol; extract from GoBridgeDemon's `NSConnection` registration if needed.
 -ppc slice of the universal binary was not analyzed (Ghidra analyzed the i386 slice, as in prior docs).

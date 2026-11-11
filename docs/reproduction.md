@@ -72,7 +72,7 @@ capinfos wormhole.pcap
 tcpdump -r wormhole.pcap -c 20 -v -X
 ```
 
-CBW signature is `55 53 42 43` (`USBC`), CDB starts at byte 15. E.g. LOG SENSE is `4A 01 00 00 10 ...`, REQUEST SENSE is `03 00 00 00 12 00`, INQUIRY is `12 00 00 00 24 00`, READ CAPACITY(10) is `25 00 00 00 00 00`.
+CBW signature is `55 53 42 43` (`USBC`), CDB starts at byte 15. E.g. GET EVENT STATUS NOTIFICATION is `4A 01 00 00 10 ...`, REQUEST SENSE is `03 00 00 00 12 00`, INQUIRY is `12 00 00 00 24 00`, READ CAPACITY(10) is `25 00 00 00 00 00`.
 
 ## 5. REA analysis (target-free)
 
@@ -146,7 +146,7 @@ sleep 30
 sudo pkill tcpdump
 python3 tools/filter_usbmon.py "$RAW" --device 3:15 -o captures/wormhole_bus3_idle_$(date +%F).pcap
 python3 tools/wormhole_parse.py captures/wormhole_bus3_idle_*.pcap
-# expect: only kernel LOG SENSE / REQUEST SENSE pairs, 0 vendor HID (0xD9),
+# expect: only kernel GET EVENT STATUS NOTIFICATION / REQUEST SENSE pairs, 0 vendor HID (0xD9),
 # 0 Wormhole HID reports — as in docs/capture-log.md
 ```
 
@@ -187,7 +187,7 @@ python3 tools/wormhole_parse.py captures/wormhole_bus3_live_*.pcap --json | less
 | Bulk CBW with CDB opcode `0xD9`, byte 1 `3/4/6`, footer `OT` | Bulk-Only transactions, `vendorHID` column | Host → cable HID packet (`OTi_SendHIDPacket`). Parser decodes type/payload in the `vendorHID` tail. |
 | Bulk CBW with `0xD8` (16 B in) or `0xD9 0x28`/`0x2A` (64 KiB) | `candidateUPipe` flag, or `0xD9` with an unknown type | UPipe poll / fetch / send (file and clipboard channel). The parser does not decode these yet (#8); see `docs/upipe-protocol.md`, whose `tools/upipe_peer.py` is the easier way to drive and log UPipe traffic. |
 | Interrupt IN on EP3 (mouse) / EP4 (keyboard) for the Wormhole `Bus:Dev` | `HID interrupt reports` section | Cable → host replay of the peer's input. EP3: 4-byte mouse (buttons/X/Y/wheel); EP4: 8-byte keyboard (modifiers + 6 keys). |
-| Only `LOG SENSE`/`REQUEST SENSE` pairs, zero of the above | Same sections empty | No session was driven — check that GoBridge is running on both ends and the switch hotkey matched. |
+| Only `GET EVENT STATUS NOTIFICATION`/`REQUEST SENSE` pairs, zero of the above | Same sections empty | No session was driven — check that GoBridge is running on both ends and the switch hotkey matched. |
 
 ### 6.5 Injecting a test packet (single-host, no GoBridge)
 

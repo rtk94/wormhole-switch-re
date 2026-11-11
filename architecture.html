@@ -406,7 +406,7 @@
   <rect x="44" y="512" width="286" height="62" rx="6" fill="rgba(245,158,11,0.10)" stroke="rgba(245,158,11,0.45)" stroke-width="1"/>
   <text x="187" y="530" text-anchor="middle" font-size="10" font-weight="600" fill="#fbbf24">If 0 · CD-ROM</text>
   <text x="187" y="546" text-anchor="middle" font-size="7.5" fill="#8a8f98" class="mono">Bulk-Only · EP1 IN / EP2 OUT</text>
-  <text x="187" y="558" text-anchor="middle" font-size="7.5" fill="#8a8f98" class="mono">512 B · PDT=5 · LOG SENSE polling</text>
+  <text x="187" y="558" text-anchor="middle" font-size="7.5" fill="#8a8f98" class="mono">512 B · PDT=5 · 0x4A media polling</text>
 
   <rect x="346" y="512" width="286" height="62" rx="6" fill="rgba(16,185,129,0.10)" stroke="rgba(16,185,129,0.40)" stroke-width="1"/>
   <text x="489" y="530" text-anchor="middle" font-size="10" font-weight="600" fill="#34d399">If 1 · HID Mouse</text>
@@ -458,7 +458,7 @@
     <tr><td class="k">Mouse (type 3)</td><td class="v">btn + dX/dY/dWheel</td></tr>
     <tr><td class="k">Multimedia (type 6)</td><td class="v">consumer usage code</td></tr>
     <tr><td class="k">UPipe</td><td class="v">0xD8 poll · 0xD9 0x28 fetch / 0x2A send</td></tr>
-    <tr><td class="k">SCSI</td><td class="v">PDT=5 (CD-ROM) · LOG SENSE polling</td></tr>
+    <tr><td class="k">SCSI</td><td class="v">PDT=5 (CD-ROM) · 0x4A media polling</td></tr>
   </table>
 </div>
 

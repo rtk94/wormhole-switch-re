@@ -7,7 +7,7 @@ Followed `reverse-engineer-anything` v49 → `references/device-protocol-analysi
 1. **Identify transport** — `lsusb` + `lsusb -t` + `/sys/bus/usb/devices` + `lsusb -v -d 0711:2211`. Established Bulk-Only mass storage + two boot HID interfaces. No video class (no USB camera on this host — 0x0E absent, no `/dev/video*`).
 2. **Map kernel bindings** — `usb-storage`, `usbhid`, `/sys/block/srX`, `/dev/sgY`, `hidraw*`, `/proc/bus/input/devices`. Established `/dev/srX` (removable CD-ROM), `sgX`, `event*` input handlers.
 3. **Capture traffic** — Linux `usbmon` + `tcpdump -i usbmon3` (bus 3). CBW (`USBC`) / CSW (`USBS`) reconstructed by hex dump; DATA IN decoded as SCSI sense / inquiry / capacity.
-4. **Reconstruct command protocol** — SCSI opcode histogram + CDB decoding; LOG SENSE rejection and capacity anomaly documented as observed behaviour, not inferred firmware design.
+4. **Reconstruct command protocol** — SCSI opcode histogram + CDB decoding; GET EVENT STATUS NOTIFICATION (`0x4A`) rejection and capacity anomaly documented as observed behaviour, not inferred firmware design.
 5. **Map host binaries (REA)** —
    - Windows PE suite: `inspect_pe_imports` → `inspect_pe_resources` → `inspect_pe_certificates` on `SKLoader.exe` (dependency graph, embedded DLL, Authenticode chain). Then carved resource payload and re-ran `inspect_pe_imports` on the UPX stub.
    - Mac bundle: `open_binary` on `GoBridgeDemon`, fallback ELF strings for Mach-O symlinks (`@executable_path/../Frameworks/...`).

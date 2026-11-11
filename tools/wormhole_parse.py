@@ -19,9 +19,14 @@ What it does
   opcode is 0xD9, byte 1 is '3' (mouse) / '4' (keyboard) / '6'
   (multimedia), bytes 2-13 are a 12-byte HID payload, and bytes 14-15
   are 'O' 'T' (OTiTransfer::sendHIDPacket -- see docs/transport.md and
-  docs/mac-gobridge.md).  Any other CDB in the SPC vendor range is also
-  flagged as a potential UPipe / file-transfer packet and reported with
-  raw hex so a live capture can characterise it.
+  docs/mac-gobridge.md).
+* Decodes the UPipe file/clipboard channel (docs/upipe-protocol.md)
+  with the decoders in tools/upipe_peer.py: the 0xD8 status poll and
+  its reply state, the 0xD9 0x28 fetch / 0xD9 0x2A send 64 KiB packets
+  (chunk header, integrity tail, terminator), and the GoBridge commands
+  reassembled from those chunks per device and direction.  Any other
+  CDB in the SPC vendor range is flagged ``candidate_upipe`` and
+  reported with raw hex.
 * Decodes boot HID interrupt reports: EP3 mouse (4 bytes: buttons,
   signed X/Y/Wheel) and EP4 keyboard (8 bytes: modifiers + 6 keys).
   This is how a peer-active session differs from the idle capture
@@ -102,6 +107,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import upipe_peer as upipe
+
 # pcap LINKTYPE_USB_LINUX_MMAPPED.  Wireshark reports this as
 # encapsulation 115 (usb-linux-mmap); the on-disk pcap linktype field
 # is 220.  195 is the legacy DLT_USB_LINUX_MMAPPED with the same
@@ -128,11 +135,12 @@ SCSI_OPCODES = {
     0x2A: "WRITE(10)",
     0x43: "READ TOC/PMA/ATIP",
     0x46: "GET CONFIGURATION",
-    0x4A: "LOG SENSE",
+    0x4A: "GET EVENT STATUS NOTIFICATION",
     0x5A: "MODE SENSE(10)",
     0x9E: "READ CAPACITY(16)",
     0xA0: "RECEIVE DIAGNOSTIC",
     0xA3: "REPORT LUNs",
+    0xD8: "UPIPE POLL (0xD8)",
     0xD9: "WORMHOLE VENDOR HID (0xD9)",
 }
 SENSE_KEYS = {
@@ -163,6 +171,30 @@ VENDOR_HID_TYPES = {
 VENDOR_HID_FOOTER = b"OT"             # CDB bytes 14-15
 VENDOR_HID_LEN = 16
 VENDOR_RANGE = (0xC0, 0xFF)           # SPC vendor-specific opcodes
+
+# --- UPipe peer channel (OTiTransfer GetRemoteHostStatus/GetData/PutData)
+# The file/clipboard pipe shares the Bulk-Only pipe with the HID path:
+# a 0xD8 status poll, and 0xD9 with byte 1 0x28 (fetch, 64 KiB in) or
+# 0x2A (send, 64 KiB out) instead of a HID type.  Framing and commands
+# are decoded with tools/upipe_peer.py; see docs/upipe-protocol.md.
+UPIPE_POLL_OPCODE = 0xD8
+UPIPE_TRANSFER_TYPES = {0x28: "fetch", 0x2A: "send"}
+UPIPE_NAMES = {
+    "poll": "UPIPE POLL (0xD8)",
+    "fetch": "UPIPE FETCH (0xD9 0x28)",
+    "send": "UPIPE SEND (0xD9 0x2A)",
+}
+
+
+def upipe_kind(cdb: bytes) -> str | None:
+    """'poll', 'fetch' or 'send' for a UPipe CDB, else None."""
+    if not cdb:
+        return None
+    if cdb[0] == UPIPE_POLL_OPCODE:
+        return "poll"
+    if cdb[0] == VENDOR_HID_MAGIC and len(cdb) >= 2:
+        return UPIPE_TRANSFER_TYPES.get(cdb[1])
+    return None
 
 # HID report identification (from the config descriptor in the capture:
 # If 1 = boot mouse EP3 IN, If 2 = boot keyboard EP4 IN)
@@ -425,7 +457,17 @@ class Transaction:
         return self.cbw.cdb[0] if self.cbw.cdb else 0
 
     @property
+    def upipe_kind(self) -> str | None:
+        return upipe_kind(self.cbw.cdb)
+
+    @property
+    def is_upipe(self) -> bool:
+        return self.upipe_kind is not None
+
+    @property
     def opcode_name(self) -> str:
+        if self.is_upipe:
+            return UPIPE_NAMES[self.upipe_kind]
         return SCSI_OPCODES.get(self.opcode, "UNKNOWN 0x%02X" % self.opcode)
 
     @property
@@ -434,7 +476,8 @@ class Transaction:
 
     @property
     def is_vendor_hid(self) -> bool:
-        return bool(self.cbw.cdb) and self.cbw.cdb[0] == VENDOR_HID_MAGIC
+        return (bool(self.cbw.cdb) and self.cbw.cdb[0] == VENDOR_HID_MAGIC
+                and not self.is_upipe)
 
 
 def parse_cbw(payload: bytes) -> CbW | None:
@@ -494,7 +537,9 @@ def parse_transactions(packets: list[UrbPacket]) -> list[Transaction]:
                                   cbw=CbW(0, 0, 0, 0, b"", p.frame, p.ts))
                 txn.csw = csw
                 txns.append(txn)
-        elif p.kind == "C":
+        elif p.kind == "C" or p.direction == "OUT":
+            # usbmon records IN data when the URB completes and OUT
+            # data when it is submitted (e.g. a 64 KiB UPipe send).
             txn = pending.get((p.bus, p.dev))
             if txn is not None:
                 txn.data += p.payload
@@ -520,6 +565,15 @@ def decode_vendor_cdb(cdb: bytes) -> dict:
         "cdb_hex": cdb.hex(),
         "cdb_len": len(cdb),
     }
+    kind = upipe_kind(cdb)
+    if kind is not None:
+        out.update({"is_vendor_hid": False, "is_upipe": True,
+                    "upipe_kind": kind, "name": UPIPE_NAMES[kind]})
+        if len(cdb) >= 16:
+            out["footer_ok"] = cdb[14:16] == VENDOR_HID_FOOTER
+        if kind == "poll" and len(cdb) >= 5:
+            out["tx_pending"] = struct.unpack_from(">H", cdb, 3)[0]
+        return out
     if op == VENDOR_HID_MAGIC:
         out["is_vendor_hid"] = True
         out["name"] = "WORMHOLE VENDOR HID (0xD9)"
@@ -605,9 +659,9 @@ def decode_cdb(cdb: bytes) -> dict:
     elif op == 0x46 and len(cdb) >= 10:                   # GET CONFIGURATION
         out["starting_feature"] = struct.unpack_from(">H", cdb, 2)[0]
         out["alloc_len"] = struct.unpack_from(">H", cdb, 7)[0]
-    elif op == 0x4A and len(cdb) >= 10:                   # LOG SENSE
-        out["page_code"] = cdb[2]
-        out["subpage_code"] = cdb[3]
+    elif op == 0x4A and len(cdb) >= 10:                   # GET EVENT STATUS NOTIFICATION
+        out["polled"] = bool(cdb[1] & 0x01)
+        out["notification_class_request"] = cdb[4]
         out["alloc_len"] = struct.unpack_from(">H", cdb, 7)[0]
     elif op == 0x9E and len(cdb) >= 16:                   # READ CAPACITY(16)
         out["service_action"] = cdb[10] & 0x1F
@@ -954,7 +1008,20 @@ def decode_data(txn: Transaction) -> dict:
     # (e.g. a UPipe packet) keep it raw and flagged.
     if VENDOR_RANGE[0] <= op <= VENDOR_RANGE[1]:
         out["vendor_data"] = True
-        if op == VENDOR_HID_MAGIC:
+        kind = txn.upipe_kind
+        if kind == "poll":
+            try:
+                out["upipe_status"] = upipe.parse_status(data)
+            except ValueError as e:
+                out["upipe_status"] = {"decode_error": str(e)}
+        elif kind is not None:
+            chunk = decode_upipe_chunk(data)
+            out["upipe_chunk"] = chunk
+            if (not chunk.get("decode_error") and not chunk["terminator"]
+                    and chunk["index"] == 0 and chunk["total"] == 1):
+                out["upipe_command"] = upipe.describe_command(
+                    upipe.parse_chunk(data)["data"])
+        elif op == VENDOR_HID_MAGIC:
             out["note"] = "unexpected data phase on 0xD9 HID packet"
         else:
             out["note"] = "possible UPipe / file-transfer payload -- magic unknown"
@@ -993,6 +1060,60 @@ def decode_data(txn: Transaction) -> dict:
     return out
 
 
+def decode_upipe_chunk(data: bytes) -> dict:
+    """Chunk header of one 64 KiB UPipe packet, plus integrity checks."""
+    if len(data) < upipe.HEADER.size:
+        return {"decode_error": "short packet (%d bytes)" % len(data)}
+    try:
+        chunk = upipe.parse_chunk(data)
+    except ValueError as e:
+        return {"decode_error": str(e)}
+    chunk.pop("data")
+    chunk["tail_ok"] = upipe.packet_tail_ok(data)
+    chunk["terminator"] = chunk["seq"] == 0
+    return chunk
+
+
+def reassemble_upipe(txns: list[Transaction]) -> list[dict]:
+    """Rebuild UPipe commands from fetch/send chunks.
+
+    Chunks are collected per capture, device and direction ('fetch' =
+    from the peer, 'send' = to the peer) and per command session, as
+    CommandDataBuffer does.  Only transactions with a good CSW count: a
+    send the cable rejected is retried by the sender.  Each completed
+    command is decoded with upipe_peer.describe_command.
+    """
+    state: dict[tuple, tuple[upipe.Reassembler, dict]] = {}
+    out: list[dict] = []
+    for t in txns:
+        kind = t.upipe_kind
+        if kind not in ("fetch", "send") or t.csw is None or t.csw.status != 0:
+            continue
+        if len(t.data) < upipe.HEADER.size:
+            continue
+        try:
+            chunk = upipe.parse_chunk(t.data)
+        except ValueError:
+            continue
+        if chunk["seq"] == 0:
+            continue  # terminator
+        key = (t.capture_id, t.bus, t.dev, kind)
+        reasm, frames = state.setdefault(key, (upipe.Reassembler(), {}))
+        frames.setdefault(chunk["session"], []).append(t.cbw.frame)
+        cmd = reasm.add(chunk)
+        if cmd is None:
+            continue
+        cmd_frames = frames.pop(chunk["session"])
+        out.append({
+            "capture_id": t.capture_id, "bus": t.bus, "dev": t.dev,
+            "direction": kind, "session": chunk["session"],
+            "first_frame": min(cmd_frames), "last_frame": max(cmd_frames),
+            "chunks": len(cmd_frames),
+            **upipe.describe_command(cmd),
+        })
+    return out
+
+
 def transaction_to_dict(txn: Transaction, first_ts: float) -> dict:
     csw = txn.csw
     status = csw.status if csw else None
@@ -1027,6 +1148,7 @@ def summarise(pcap: PcapData) -> dict:
     devices = discover_devices(pcap.packets)
     txns = parse_transactions(pcap.packets)
     hid_reports = parse_hid_reports(pcap.packets)
+    upipe_cmds = reassemble_upipe(txns)
     per_device: dict[str, dict] = {}
     for key, info in sorted(devices.items()):
         bus, dev = key
@@ -1040,6 +1162,8 @@ def summarise(pcap: PcapData) -> dict:
             CSW_STATUS_NAMES.get(t.csw.status, "unknown")
             for t in dev_txns if t.csw is not None)
         vendor_hid = [t for t in dev_txns if t.is_vendor_hid]
+        upipe_counts = collections.Counter(t.upipe_kind for t in dev_txns
+                                           if t.is_upipe)
         vendor_all = [t for t in dev_txns if t.is_vendor]
         hid_hist = collections.Counter(
             r.get("kind", "unknown") for r in hid_reports
@@ -1061,8 +1185,14 @@ def summarise(pcap: PcapData) -> dict:
                 decode_vendor_cdb(t.cbw.cdb).get("hid_type", "unknown")
                 for t in vendor_hid)),
             "vendor_cdb_packets": len(vendor_all),
+            "upipe_packets": {k: upipe_counts.get(k, 0)
+                              for k in ("poll", "fetch", "send")},
+            "upipe_commands": sum(
+                1 for c in upipe_cmds if (c["bus"], c["dev"]) == key),
+            # vendor CDBs that are neither HID nor a known UPipe CDB
             "candidate_upipe_packets": sum(
-                1 for t in vendor_all if not t.is_vendor_hid),
+                1 for t in vendor_all
+                if not t.is_vendor_hid and not t.is_upipe),
             "hid_reports": len(dev_hid),
             "hid_kind_histogram": dict(hid_hist),
             "hid_samples": dev_hid[:5],
@@ -1078,6 +1208,12 @@ def summarise(pcap: PcapData) -> dict:
             d["vendor_hid_packets"] for d in per_device.values()),
         "total_candidate_upipe_packets": sum(
             d["candidate_upipe_packets"] for d in per_device.values()),
+        "total_upipe_packets": sum(
+            sum(d["upipe_packets"].values()) for d in per_device.values()),
+        "upipe_packets": {k: sum(d["upipe_packets"][k]
+                                 for d in per_device.values())
+                          for k in ("poll", "fetch", "send")},
+        "upipe_commands": upipe_cmds,
         "total_hid_reports": len(hid_reports),
         "hid_reports": hid_reports,
     }
@@ -1122,6 +1258,8 @@ def _fmt_txn(t: dict) -> str:
             t.get("footer_ok"), t.get("valid_hid_framing"))
         if data.get("len"):
             extra += " data[%d]=%s" % (data["len"], data["hex"][:48])
+    elif t.get("is_upipe"):
+        extra = " " + _fmt_upipe_data(t)
     elif t.get("candidate_upipe"):
         extra = " candidateUPipe CDB=%s dataLen=%d %s" % (
             t.get("cdb_hex", "")[:32], t.get("cbw_data_len", 0),
@@ -1142,6 +1280,46 @@ def _fmt_txn(t: dict) -> str:
         t["cbw_frame"], t["t_offset_s"] or 0, t["tag"], t["name"],
         t.get("cdb_hex", ""), t["direction"], t["cbw_data_len"],
         t["csw_status_name"], extra)
+
+
+def _fmt_upipe_data(t: dict) -> str:
+    data = t.get("data") or {}
+    if t.get("upipe_kind") == "poll":
+        parts = ["tx_pending=%s" % t.get("tx_pending")]
+        st = data.get("upipe_status")
+        if st:
+            parts.append("state=%s(%s)" % (st.get("state"), st.get("name"))
+                         if "state" in st else "status_error=%s" % st["decode_error"])
+            if "waiting" in st:
+                parts.append("waiting=%d" % st["waiting"])
+        return " ".join(parts)
+    chunk = data.get("upipe_chunk")
+    if not chunk:
+        return "no data"
+    if chunk.get("decode_error"):
+        return "chunk_error=%s" % chunk["decode_error"]
+    if chunk["terminator"]:
+        return "terminator tail_ok=%s" % chunk["tail_ok"]
+    out = "seq=%d session=%d chunk %d/%d len=%d tail_ok=%s" % (
+        chunk["seq"], chunk["session"], chunk["index"] + 1, chunk["total"],
+        chunk["length"], chunk["tail_ok"])
+    cmd = data.get("upipe_command")
+    if cmd and cmd.get("command") is not None:
+        out += " cmd=0x%02X %s" % (cmd["command"], cmd["command_name"])
+    return out
+
+
+def _fmt_upipe_commands(cmds: list[dict]) -> list[str]:
+    lines = []
+    skip = {"capture_id", "bus", "dev", "direction", "session", "first_frame",
+            "last_frame", "chunks", "command", "command_name", "len"}
+    for c in cmds:
+        detail = " ".join("%s=%r" % (k, c[k]) for k in sorted(c) if k not in skip)
+        lines.append("  f%d-f%d %d:%d %s %s (0x%02X) len=%d chunks=%d %s" % (
+            c["first_frame"], c["last_frame"], c["bus"], c["dev"],
+            c["direction"], c["command_name"], c["command"], c["len"],
+            c["chunks"], detail))
+    return lines
 
 
 def _fmt_hid_section(hid_reports: list[dict], limit: int = 20) -> list[str]:
@@ -1310,10 +1488,14 @@ def main(argv: list[str] | None = None) -> int:
     print("SHA-256: %s" % summary["sha256"])
     print("Packets: %d  duration: %.3fs  linktype: %d (usb-linux-mmap)" % (
         summary["packets"], summary["duration_s"], summary["linktype"]))
-    print("Vendor HID (0xD9) packets: %d  candidate UPipe: %d  HID reports: %d" % (
-        summary.get("total_vendor_hid_packets", 0),
-        summary.get("total_candidate_upipe_packets", 0),
-        summary.get("total_hid_reports", 0)))
+    up_counts = summary.get("upipe_packets", {})
+    print("Vendor HID (0xD9) packets: %d  UPipe: poll %d / fetch %d / send %d"
+          "  other vendor CDBs: %d  HID reports: %d" % (
+              summary.get("total_vendor_hid_packets", 0),
+              up_counts.get("poll", 0), up_counts.get("fetch", 0),
+              up_counts.get("send", 0),
+              summary.get("total_candidate_upipe_packets", 0),
+              summary.get("total_hid_reports", 0)))
     print()
     print("\n".join(_fmt_device_table(summary)))
 
@@ -1330,6 +1512,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\nSCSI Bulk-Only transactions (%d):" % len(txn_dicts))
         for t in txn_dicts:
             print(_fmt_txn(t))
+
+    cmds = [c for c in summary.get("upipe_commands", [])
+            if want is None or (c["bus"], c["dev"]) in want]
+    if cmds:
+        print("\nUPipe commands (%d):" % len(cmds))
+        print("\n".join(_fmt_upipe_commands(cmds)))
 
     # HID detail for focused devices.
     hid = [r for r in summary.get("hid_reports", [])

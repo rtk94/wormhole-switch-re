@@ -198,7 +198,7 @@ microcontroller forwards it to the peer end; the peer's OTiTransfer
 `RunLoopFunction`/`ReceiveData`/`processReceiveState` collects packets
 (`GetData`/`PutData`, Tx/Rx queues) and GoBridgeDemon replays them as
 CGEvents. This is why the idle Linux capture shows only standard kernel
-CDBs (INQUIRY / LOG SENSE / …): vendor CDBs only appear when the
+CDBs (INQUIRY / GET EVENT STATUS NOTIFICATION / …): vendor CDBs only appear when the
 Wormhole software actively sends HID/file data. File-transfer packets
 use the same `SendSCSICommand*` plumbing with a data phase
 (`CFData` at `+0x2c`); their packet magic still needs a live

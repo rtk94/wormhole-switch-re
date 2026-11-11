@@ -70,7 +70,7 @@ class TestCommittedCapture(unittest.TestCase):
         self.assertEqual(len(self.wormhole), 42)
         hist = self.summary["devices"]["3:15"]["opcode_histogram"]
         self.assertEqual(hist, {
-            "LOG SENSE": 16,
+            "GET EVENT STATUS NOTIFICATION": 16,
             "REQUEST SENSE": 16,
             "TEST UNIT READY": 4,
             "INQUIRY": 2,
@@ -79,7 +79,7 @@ class TestCommittedCapture(unittest.TestCase):
             "GET CONFIGURATION": 1,
         })
         csw = self.summary["devices"]["3:15"]["csw_status_histogram"]
-        # Only the LOG SENSE probes fail.
+        # Only the GET EVENT STATUS NOTIFICATION (0x4A) probes fail.
         self.assertEqual(csw.get("CHECK CONDITION"), 16)
 
     def test_inquiry_decode(self):
@@ -174,10 +174,16 @@ class TestUnitDecoders(unittest.TestCase):
         self.assertEqual(out["lba"], 1)
         self.assertEqual(out["transfer_len_blocks"], 1)
 
-    def test_decode_cdb_log_sense(self):
+    def test_decode_cdb_get_event_status_notification(self):
+        # MMC GET EVENT STATUS NOTIFICATION (0x4A), not SPC LOG SENSE
+        # (0x4D): byte 1 bit 0 = Polled, byte 4 = notification class
+        # request (0x10 = media), bytes 7-8 = allocation length.
         out = wp.decode_cdb(bytes.fromhex("4a010000100000000800"))
-        self.assertEqual(out["name"], "LOG SENSE")
+        self.assertEqual(out["name"], "GET EVENT STATUS NOTIFICATION")
+        self.assertTrue(out["polled"])
+        self.assertEqual(out["notification_class_request"], 0x10)
         self.assertEqual(out["alloc_len"], 8)
+        self.assertNotIn("page_code", out)
 
     def test_decode_cdb_unknown_opcode(self):
         # 0x0B is an obsolete SEEK opcode not in SCSI_OPCODES and
@@ -943,6 +949,284 @@ class TestHidSendPairingCaptures(unittest.TestCase):
         blob = json.dumps(self.merged_pairing, sort_keys=True)
         self.assertIn("003c0000", blob)
         self.assertIn("send_payload_hex", blob)
+
+
+import upipe_peer as up  # noqa: E402
+
+
+def _urb(frame, kind, endpoint, payload, ts=None, bus=5, dev=111, xfer=3,
+         status=0):
+    return wp.UrbPacket(
+        frame=frame, ts=frame / 1000.0 if ts is None else ts,
+        urb_id=frame, kind=kind, xfer=xfer, endpoint=endpoint, dev=dev,
+        bus=bus, flag_setup=1, flag_data=0, status=status,
+        length=len(payload), data_len=len(payload), setup=None,
+        interval=0, transfer_flags=0, payload=payload)
+
+
+def _scsi(frame, tag, cdb, data=b"", data_in=True, data_len=None,
+          csw_status=0, **kw):
+    """One Bulk-Only transaction as usbmon records it.
+
+    The data phase of an IN transfer is in the COMPLETE event; the data
+    of an OUT transfer is in the SUBMIT event (usbmon captures OUT data
+    when the URB is submitted, IN data when it completes).
+    """
+    n = len(data) if data_len is None else data_len
+    cbw = (b"USBC" + struct.pack("<II", tag, n)
+           + bytes([0x80 if data_in else 0, 0, len(cdb)]) + cdb).ljust(31, b"\0")
+    pkts = [_urb(frame, "S", 0x02, cbw, **kw)]
+    if data:
+        if data_in:
+            pkts.append(_urb(frame + 1, "C", 0x81, data, **kw))
+        else:
+            pkts.append(_urb(frame + 1, "S", 0x02, data, **kw))
+    csw = b"USBS" + struct.pack("<II", tag, 0) + bytes([csw_status])
+    pkts.append(_urb(frame + 2, "C", 0x81, csw, **kw))
+    return pkts
+
+
+def _write_pcap(path, packets):
+    """Serialise UrbPackets as a classic little-endian usbmon pcap."""
+    out = bytearray(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0,
+                                0x40000, 220))
+    for p in packets:
+        hdr = bytearray(64)
+        struct.pack_into("<Q", hdr, 0, p.urb_id)
+        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12] = (
+            ord(p.kind), p.xfer, p.endpoint, p.dev, p.bus)
+        hdr[14], hdr[15] = p.flag_setup, p.flag_data
+        sec, usec = int(p.ts), int(round((p.ts % 1) * 1e6))
+        struct.pack_into("<iii", hdr, 16, sec, 0, usec)
+        struct.pack_into("<iII", hdr, 28, p.status, p.length, p.data_len)
+        rec = bytes(hdr) + p.payload
+        out += struct.pack("<IIII", sec, usec, len(rec), len(rec)) + rec
+    Path(path).write_bytes(bytes(out))
+
+
+FETCH = up.build_fetch_cdb()
+SEND = up.build_send_cdb()
+
+
+class TestUpipeCdb(unittest.TestCase):
+    """UPipe CDBs (#8): 0xD8 poll, 0xD9 0x28 fetch, 0xD9 0x2A send."""
+
+    def test_poll_cdb_is_upipe_not_candidate(self):
+        out = wp.decode_cdb(up.build_poll_cdb(0x0102))
+        self.assertTrue(out["is_vendor"])
+        self.assertTrue(out["is_upipe"])
+        self.assertEqual(out["upipe_kind"], "poll")
+        self.assertEqual(out["name"], "UPIPE POLL (0xD8)")
+        self.assertEqual(out["tx_pending"], 0x0102)
+        self.assertTrue(out["footer_ok"])
+        self.assertFalse(out["is_vendor_hid"])
+        self.assertNotIn("candidate_upipe", out)
+
+    def test_fetch_cdb_is_upipe_not_hid(self):
+        out = wp.decode_cdb(FETCH)
+        self.assertTrue(out["is_upipe"])
+        self.assertEqual(out["upipe_kind"], "fetch")
+        self.assertEqual(out["name"], "UPIPE FETCH (0xD9 0x28)")
+        self.assertFalse(out["is_vendor_hid"])
+        self.assertNotIn("valid_hid_framing", out)
+        self.assertNotIn("candidate_upipe", out)
+
+    def test_send_cdb_is_upipe_not_hid(self):
+        out = wp.decode_cdb(SEND)
+        self.assertEqual(out["upipe_kind"], "send")
+        self.assertEqual(out["name"], "UPIPE SEND (0xD9 0x2A)")
+        self.assertFalse(out["is_vendor_hid"])
+
+    def test_send_cdb_with_stack_garbage_still_classifies(self):
+        # The Mac leaves CDB bytes 3-13 of a send as stack garbage.
+        cdb = bytes([0xD9, 0x2A, 0xFF]) + bytes(range(1, 12)) + b"OT"
+        self.assertEqual(wp.decode_cdb(cdb)["upipe_kind"], "send")
+
+    def test_other_vendor_opcode_stays_candidate(self):
+        out = wp.decode_cdb(bytes([0xC2]) + bytes(15))
+        self.assertTrue(out["candidate_upipe"])
+        self.assertFalse(out.get("is_upipe", False))
+
+    def test_transaction_properties(self):
+        def txn(cdb):
+            return wp.Transaction(bus=5, dev=111, cbw=wp.CbW(
+                tag=1, data_len=0, flags=0x80, lun=0, cdb=cdb, frame=1, ts=0.0))
+        fetch = txn(FETCH)
+        self.assertTrue(fetch.is_upipe)
+        self.assertFalse(fetch.is_vendor_hid)
+        self.assertEqual(fetch.opcode_name, "UPIPE FETCH (0xD9 0x28)")
+        self.assertEqual(txn(up.build_poll_cdb()).opcode_name,
+                         "UPIPE POLL (0xD8)")
+        hid = txn(wp.build_vendor_hid_cdb("3", bytes(12)))
+        self.assertTrue(hid.is_vendor_hid)
+        self.assertFalse(hid.is_upipe)
+
+
+class TestUpipeData(unittest.TestCase):
+    """Data-phase decode, reusing the upipe_peer decoders."""
+
+    def _txn(self, cdb, data, data_in=True):
+        txns = wp.parse_transactions(_scsi(1, 7, cdb, data, data_in=data_in))
+        self.assertEqual(len(txns), 1)
+        return txns[0]
+
+    def test_poll_reply_decodes_state_and_waiting(self):
+        reply = bytes([0x05, 0x00, 0x03]) + bytes(13)
+        data = wp.decode_data(self._txn(up.build_poll_cdb(), reply))
+        self.assertEqual(data["upipe_status"]["state"], 5)
+        self.assertEqual(data["upipe_status"]["name"], "data-waiting")
+        self.assertEqual(data["upipe_status"]["waiting"], 3)
+
+    def test_fetch_packet_decodes_chunk_and_command(self):
+        pkt = up.Framer(seq=40, session=9).frame(up.encode_login("peer-x"))[0]
+        data = wp.decode_data(self._txn(FETCH, pkt))
+        chunk = data["upipe_chunk"]
+        self.assertEqual((chunk["seq"], chunk["session"], chunk["index"],
+                          chunk["total"]), (41, 9, 0, 1))
+        self.assertTrue(chunk["tail_ok"])
+        self.assertFalse(chunk["terminator"])
+        self.assertEqual(data["upipe_command"]["command_name"], "Login")
+        self.assertEqual(data["upipe_command"]["name"], "peer-x")
+        self.assertNotIn("note", data)
+
+    def test_terminator_packet(self):
+        pkt = up.Framer().frame(b"\x02")[-1]
+        chunk = wp.decode_data(self._txn(FETCH, pkt))["upipe_chunk"]
+        self.assertTrue(chunk["terminator"])
+        self.assertTrue(chunk["tail_ok"])
+
+    def test_send_data_is_taken_from_the_out_submit(self):
+        pkt = up.Framer().frame(up.encode_response(0x01))[0]
+        txn = self._txn(SEND, pkt, data_in=False)
+        self.assertEqual(len(txn.data), up.PACKET_LEN)
+        data = wp.decode_data(txn)
+        self.assertEqual(data["upipe_command"]["command_name"],
+                         "ResponseResult")
+
+    def test_truncated_packet_keeps_header_and_fails_tail(self):
+        pkt = up.Framer().frame(up.encode_login("peer-x"))[0][:1000]
+        chunk = wp.decode_data(self._txn(FETCH, pkt))["upipe_chunk"]
+        self.assertEqual(chunk["index"], 0)
+        self.assertFalse(chunk["tail_ok"])
+
+    def test_runt_packet_does_not_raise(self):
+        data = wp.decode_data(self._txn(FETCH, b"\x01\x02\x03"))
+        self.assertIn("decode_error", data["upipe_chunk"])
+
+    def test_bad_chunk_length_reports_error(self):
+        pkt = bytearray(up.Framer().frame(b"\x02")[0])
+        struct.pack_into("<I", pkt, 16, 0xFFFFFF)
+        chunk = wp.decode_data(self._txn(FETCH, bytes(pkt)))["upipe_chunk"]
+        self.assertIn("decode_error", chunk)
+
+
+class TestUpipeReassembly(unittest.TestCase):
+    """Commands rebuilt from chunks across transactions, per direction."""
+
+    def _packets(self, cmd_pkts, cdb, data_in, start=1, csw_status=0, tag0=1):
+        out = []
+        for i, pkt in enumerate(cmd_pkts):
+            out += _scsi(start + 3 * i, tag0 + i, cdb, pkt, data_in=data_in,
+                         csw_status=csw_status)
+        return out
+
+    def test_multi_chunk_command_is_reassembled(self):
+        # Clipboard text travels as hex of UTF-16LE: 4 bytes per char.
+        text = "x" * (up.CHUNK_DATA // 4 + 100)
+        pkts = up.Framer().frame(up.encode_clipboard_text(text))
+        self.assertEqual(len(pkts), 3)  # 2 chunks + terminator
+        txns = wp.parse_transactions(self._packets(pkts, FETCH, True))
+        cmds = wp.reassemble_upipe(txns)
+        self.assertEqual(len(cmds), 1)
+        c = cmds[0]
+        self.assertEqual(c["direction"], "fetch")
+        self.assertEqual(c["command_name"], "XmlPacket")
+        self.assertEqual(c["chunks"], 2)
+        self.assertEqual((c["first_frame"], c["last_frame"]), (1, 4))
+        self.assertEqual(c["text"], text)
+
+    def test_directions_reassemble_independently(self):
+        f = up.Framer(session=1)
+        g = up.Framer(session=1)  # same session numbers on both sides
+        pkts = (self._packets(f.frame(up.encode_login("a")), FETCH, True)
+                + self._packets(g.frame(up.encode_response(1)), SEND, False,
+                                start=100, tag0=50))
+        cmds = wp.reassemble_upipe(wp.parse_transactions(pkts))
+        self.assertEqual([(c["direction"], c["command_name"]) for c in cmds],
+                         [("fetch", "Login"), ("send", "ResponseResult")])
+
+    def test_failed_send_is_not_counted(self):
+        # A send rejected with CHECK CONDITION (no fetching peer) is
+        # retried by the sender; the rejected copy carries nothing.
+        pkt = up.Framer().frame(up.encode_response(1))[0]
+        pkts = self._packets([pkt], SEND, False, csw_status=1)
+        self.assertEqual(wp.reassemble_upipe(wp.parse_transactions(pkts)), [])
+
+    def test_incomplete_command_is_not_reported(self):
+        pkts = up.Framer().frame(up.encode_clipboard_text("y" * up.CHUNK_DATA * 2))
+        txns = wp.parse_transactions(self._packets(pkts[:1], FETCH, True))
+        self.assertEqual(wp.reassemble_upipe(txns), [])
+
+
+class TestUpipeSummaryAndCli(unittest.TestCase):
+
+    def _capture(self):
+        pkts = []
+        for i in range(3):
+            pkts += _scsi(1 + 3 * i, 1 + i, up.build_poll_cdb(),
+                          bytes([0x07]) + bytes(15))
+        framer = up.Framer()
+        for i, pkt in enumerate(framer.frame(up.encode_login("peer-x"))):
+            pkts += _scsi(20 + 3 * i, 10 + i, FETCH, pkt)
+        pkts += _scsi(40, 30, bytes([0xC2]) + bytes(15))
+        return pkts
+
+    def test_summary_counts_upipe_separately_from_candidates(self):
+        pkts = self._capture()
+        summary = wp.summarise(wp.PcapData(
+            path="synthetic", sha256="", linktype=220, packets=pkts,
+            duration=0.0, first_ts=pkts[0].ts))
+        dev = summary["devices"]["5:111"]
+        self.assertEqual(dev["upipe_packets"],
+                         {"poll": 3, "fetch": 2, "send": 0})
+        self.assertEqual(dev["candidate_upipe_packets"], 1)
+        self.assertEqual(dev["vendor_hid_packets"], 0)
+        self.assertEqual(summary["total_upipe_packets"], 5)
+        self.assertEqual([c["command_name"] for c in summary["upipe_commands"]],
+                         ["Login"])
+
+    def test_cli_text_shows_upipe(self):
+        import contextlib
+        import io as _io
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "upipe.pcap"
+            _write_pcap(path, self._capture())
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = wp.main([str(path), "--all"])
+        self.assertEqual(rc, 0)
+        text = buf.getvalue()
+        self.assertIn("UPipe: poll 3 / fetch 2 / send 0", text)
+        self.assertIn("other vendor CDBs: 1", text)
+        self.assertIn("UPIPE FETCH (0xD9 0x28)", text)
+        self.assertIn("UPipe commands (1):", text)
+        self.assertIn("fetch Login", text)
+
+    def test_cli_json_has_upipe_commands_without_raw_data(self):
+        import contextlib
+        import io as _io
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "upipe.pcap"
+            _write_pcap(path, self._capture())
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = wp.main([str(path), "--all", "--json"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["upipe_commands"][0]["name"], "peer-x")
+        self.assertNotIn("data", out["upipe_commands"][0])
 
 
 if __name__ == "__main__":

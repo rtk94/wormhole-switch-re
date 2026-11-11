@@ -89,7 +89,7 @@ SCSI Status: Check Condition
 Sense: Illegal Request / Invalid command operation code
 ```
 
-`LOG SENSE (0x4A)` — kernel polls it about every 2 s when the device is idle (see `docs/capture-log.md`):
+`GET EVENT STATUS NOTIFICATION (0x4A)` (MMC media event polling; earlier notes called it LOG SENSE, which is `0x4D`) — kernel polls it about every 2 s when the device is idle (see `docs/capture-log.md`):
 
 ```
 CBW: 4A 01 00 00 10 00 00 00 08 00  (10-byte CDB)
@@ -192,10 +192,17 @@ runbook in `docs/reproduction.md` §6):
   (bytes 2–13), `footer_hex`/`footer_ok` (`OT`), and
   `valid_hid_framing`.  Summary counts are in `vendor_hid_packets` /
   `vendor_hid_types` per device and `total_vendor_hid_packets`
-  overall.  Non-`0xD9` CDBs in the SPC vendor range (`0xC0`–`0xFF`)
-  are flagged `candidate_upipe` with raw hex.  The parser predates the
-  UPipe decode, so it flags the `0xD8` poll and treats `0xD9 0x28`/`0x2A`
-  as malformed HID (#8).
+  overall.
+- **UPipe (`0xD8`, `0xD9 0x28`/`0x2A`):** reported as `UPIPE POLL`,
+  `UPIPE FETCH` and `UPIPE SEND` with `is_upipe`/`upipe_kind`, never as
+  HID.  The poll reply decodes to `upipe_status` (state, packets
+  waiting), each 64 KiB packet to `upipe_chunk` (seq, session, chunk
+  index/total, length, `tail_ok`, `terminator`).  Chunks are
+  reassembled per device and direction into `upipe_commands`, decoded
+  by `tools/upipe_peer.py` (`docs/upipe-protocol.md`); sends the cable
+  rejected are skipped.  Summary counts are in `upipe_packets`.  Other
+  CDBs in the SPC vendor range (`0xC0`–`0xFF`) are flagged
+  `candidate_upipe` with raw hex.
 - **Cable → host (interrupt):** interrupt IN COMPLETEs on EP3 are
   decoded as boot-mouse reports (byte 0 buttons, bytes 1–3 signed
   X/Y/wheel) and EP4 as boot-keyboard reports (byte 0 modifiers,
@@ -207,9 +214,9 @@ Verify the idle sample still shows zeros:
 
 ```sh
 python3 tools/wormhole_parse.py captures/wormhole_bus3_2026-11-06.pcap
-# Vendor HID (0xD9) packets: 0  candidate UPipe: 0  HID reports: 841
+# Vendor HID (0xD9) packets: 0  UPipe: poll 0 / fetch 0 / send 0  other vendor CDBs: 0  HID reports: 0
 # 3:15 row: ... 42  0  0  <-- WormholeSwitch
-python3 -m unittest tools.test_wormhole_parse   # 42 tests incl. vendor/HID
+python3 -m unittest tools.test_wormhole_parse
 ```
 
 ## Bus neighbours on this host (for topology context)
