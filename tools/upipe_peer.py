@@ -42,6 +42,7 @@ import argparse
 import ctypes
 import fcntl
 import hashlib
+import html
 import json
 import os
 import shutil
@@ -517,6 +518,70 @@ def decode_clipboard(xml):
     return out
 
 
+# Keyboard/mouse switching: the XmlPackets two peers exchange when the pointer
+# crosses a screen edge (#50).  (field name, XML tag) per command; the numeric
+# tags are decoded as integers.  Direction and position values: 1 = left,
+# 2 = right (the user set "Left of this PC" on Windows and "Right of this PC"
+# on the Mac; the cursor left Windows at x = -3 and the Mac at x = 1279).
+KM_SWITCH_FIELDS = {
+    "Cmd_Notify_KM_Switch_To_Remote": (
+        ("move_out_direction", "Param_Move_Out_Direction"),
+        ("move_out_x", "Param_Move_Out_X"),
+        ("move_out_y", "Param_Move_Out_Y"),
+        ("km_switch_option", "Param_Move_Out_KM_Switch_Option"),
+        ("hotkey_switch_only", "Param_Move_Out_Use_Hotkey_Switch_Only"),
+        ("other_pc_position", "Param_Other_PC_Position_Option"),
+        ("remote_screen_width", "Param_Remote_Screen_Width"),
+        ("remote_screen_height", "Param_Remote_Screen_Height"),
+    ),
+    "Cmd_Get_KM_Switch_Acknowlege": (
+        ("screen_width", "Param_Screen_Width"),
+        ("screen_height", "Param_Screen_Height"),
+        ("virtual_screen_width", "Param_Virtual_Screen_Width"),
+        ("virtual_screen_height", "Param_Virtual_Screen_Height"),
+        ("virtual_left", "Param_Left_Side_Virtual_Screen_Coordinate"),
+        ("virtual_top", "Param_Top_Side_Virtual_Screen_Coordinate"),
+        ("num_lock", "Param_NumberLock"),
+        ("caps_lock", "Param_CapsLock"),
+        ("scroll_lock", "Param_ScrollLock"),
+    ),
+    "Cmd_Force_Remote_To_Switch_Local": (
+        ("move_in_direction", "Param_Move_In_Direction"),
+        ("move_in_x", "Param_Move_In_X"),
+        ("move_in_y", "Param_Move_In_Y"),
+    ),
+}
+KM_SWITCH_TEXT = {"Cmd_Get_KM_Switch_Acknowlege": (("scroll_direction", "Param_ScrollDirection"),),
+                  "Cmd_Notify_KM_Switch_To_Remote": (("point_event_data", "Param_Point_Event_Data"),)}
+
+
+def decode_km_switch(xml):
+    """Fields of a keyboard/mouse switch XmlPacket (see KM_SWITCH_FIELDS).
+
+    Windows nests Param_KM_Setting_Info as escaped XML, the Mac does not, so
+    the XML is unescaped once before the tags are read.  Tags a sender leaves
+    out are left out of the result (the Mac's acknowledgement carries only the
+    lock state and scroll direction, Windows' also the screen geometry).
+    """
+    np_cmd = _tag(xml, "NP_Cmd")
+    if np_cmd not in KM_SWITCH_FIELDS:
+        return {}
+    flat = html.unescape(xml)
+    out = {}
+    for name, tag in KM_SWITCH_FIELDS[np_cmd]:
+        value = _tag(flat, tag)
+        if value is not None:
+            try:
+                out[name] = int(value)
+            except ValueError:
+                out[name] = value
+    for name, tag in KM_SWITCH_TEXT.get(np_cmd, ()):
+        value = _tag(flat, tag)
+        if value is not None:
+            out[name] = value
+    return out
+
+
 def encode_download_request(multi_session_id, files, endian="<"):
     """DownloadMultipleFile (0x10): ask the peer's server to send us files.
 
@@ -896,7 +961,9 @@ def _command_fields(cmd, endian):
     elif cmd[0] == CMD_RESPONSE:
         out.update(decode_response(cmd, endian))
     elif cmd[0] == CMD_XML:
-        out.update(decode_clipboard(decode_xml_packet(cmd, endian)))
+        xml = decode_xml_packet(cmd, endian)
+        out.update(decode_clipboard(xml))
+        out.update(decode_km_switch(xml))
     elif cmd[0] == CMD_CHANGE_ATTRIBUTE:
         out.update(decode_change_file_attribute(cmd, endian))
     elif cmd[0] in (CMD_DOWNLOAD_FILE_ABORT, CMD_DOWNLOAD_MULTI_ABORT):

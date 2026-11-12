@@ -187,6 +187,90 @@ class TestClipboard(unittest.TestCase):
             u.decode_xml_packet(b"\x39\x00\x00\x00\x09abc")
 
 
+class TestKmSwitch(unittest.TestCase):
+    """Keyboard/mouse switch XmlPackets, as captured from a Windows peer and
+    the Mac (#50).  Pointer and screen values only, no host or user names."""
+
+    PIPE = "<NP_Up_Notice_NamePipe_Name>\\\\.\\pipe\\OTI_ClipboardAgent</NP_Up_Notice_NamePipe_Name>"
+    HEAD = "<ExtraXmlCommand>HookAppService</ExtraXmlCommand><ExtraXmlParam><OTIMSG>"
+    TAIL = "</OTIMSG></ExtraXmlParam>"
+
+    def _describe(self, body, endian="<"):
+        xml = self.HEAD + body + self.TAIL
+        raw = xml.encode()
+        fmt = "<I" if endian == "<" else ">I"
+        return u.describe_command(bytes([u.CMD_XML]) + struct.pack(fmt, len(raw)) + raw, endian)
+
+    def test_windows_notify_escaped_settings(self):
+        d = self._describe(
+            "<NP_Cmd>Cmd_Notify_KM_Switch_To_Remote</NP_Cmd>" + self.PIPE +
+            "<Param_Move_Out_Info><OTIMSG>"
+            "<Param_Point_Event_Data>000000000005000020030000000000000000000000000000FF04000064010000</Param_Point_Event_Data>"
+            "<Param_Move_Out_Direction>1</Param_Move_Out_Direction>"
+            "<Param_Move_Out_X>-3</Param_Move_Out_X><Param_Move_Out_Y>356</Param_Move_Out_Y>"
+            "<Param_Move_Out_KM_Switch_Option>3</Param_Move_Out_KM_Switch_Option>"
+            "<Param_Move_Out_Use_Hotkey_Switch_Only>0</Param_Move_Out_Use_Hotkey_Switch_Only>"
+            "<Param_Other_PC_Position_Option>1</Param_Other_PC_Position_Option>"
+            "<Param_Remote_Screen_Width>1280</Param_Remote_Screen_Width>"
+            "<Param_Remote_Screen_Height>800</Param_Remote_Screen_Height>"
+            "<Param_KM_Setting_Info>&lt;OTIMSG&gt;&lt;Param_Move_Out_Direction&gt;1&lt;/Param_Move_Out_Direction&gt;"
+            "&lt;/OTIMSG&gt;</Param_KM_Setting_Info></OTIMSG></Param_Move_Out_Info>")
+        self.assertEqual(d["np_cmd"], "Cmd_Notify_KM_Switch_To_Remote")
+        self.assertEqual((d["move_out_direction"], d["move_out_x"], d["move_out_y"]), (1, -3, 356))
+        self.assertEqual((d["km_switch_option"], d["other_pc_position"], d["hotkey_switch_only"]), (3, 1, 0))
+        self.assertEqual((d["remote_screen_width"], d["remote_screen_height"]), (1280, 800))
+        self.assertTrue(d["point_event_data"].endswith("FF04000064010000"))
+
+    def test_mac_notify_unescaped_settings(self):
+        d = self._describe(
+            "<Param_Move_Out_Info><OTIMSG><Param_Move_Out_KM_Switch_Option>3</Param_Move_Out_KM_Switch_Option>"
+            "<Param_Move_Out_X>1279</Param_Move_Out_X><Param_Move_Out_Direction>2</Param_Move_Out_Direction>"
+            "<Param_Remote_Screen_Width>1280</Param_Remote_Screen_Width><Param_Move_Out_Y>408</Param_Move_Out_Y>"
+            "<Param_Other_PC_Position_Option>2</Param_Other_PC_Position_Option>"
+            "<Param_Remote_Screen_Height>800</Param_Remote_Screen_Height></OTIMSG></Param_Move_Out_Info>"
+            "<NP_Cmd>Cmd_Notify_KM_Switch_To_Remote</NP_Cmd>" + self.PIPE, ">")
+        self.assertEqual((d["move_out_direction"], d["move_out_x"], d["move_out_y"]), (2, 1279, 408))
+        self.assertNotIn("point_event_data", d)
+
+    def test_acknowledge_windows_geometry_and_mac_locks(self):
+        win = self._describe(
+            "<NP_Cmd>Cmd_Get_KM_Switch_Acknowlege</NP_Cmd>" + self.PIPE +
+            "<Param_Remote_Screen_Size><OTIMSG><Param_Screen_Width>1280</Param_Screen_Width>"
+            "<Param_Screen_Height>800</Param_Screen_Height><Param_Virtual_Screen_Width>1280</Param_Virtual_Screen_Width>"
+            "<Param_Virtual_Screen_Height>800</Param_Virtual_Screen_Height>"
+            "<Param_Left_Side_Virtual_Screen_Coordinate>0</Param_Left_Side_Virtual_Screen_Coordinate>"
+            "<Param_Top_Side_Virtual_Screen_Coordinate>0</Param_Top_Side_Virtual_Screen_Coordinate>"
+            "<Param_NumberLock>1</Param_NumberLock><Param_CapsLock>0</Param_CapsLock>"
+            "<Param_ScrollLock>0</Param_ScrollLock></OTIMSG></Param_Remote_Screen_Size>")
+        self.assertEqual((win["screen_width"], win["virtual_screen_height"], win["num_lock"]), (1280, 800, 1))
+        mac = self._describe(
+            "<Param_Remote_Screen_Size><OTIMSG><Param_CapsLock>0</Param_CapsLock>"
+            "<Param_ScrollDirection>Normal</Param_ScrollDirection></OTIMSG></Param_Remote_Screen_Size>"
+            "<NP_Cmd>Cmd_Get_KM_Switch_Acknowlege</NP_Cmd>" + self.PIPE, ">")
+        self.assertEqual((mac["caps_lock"], mac["scroll_direction"]), (0, "Normal"))
+        self.assertNotIn("screen_width", mac)
+
+    def test_force_remote_to_switch_local(self):
+        d = self._describe(
+            "<Param_Move_In_Info><OTIMSG><Param_Move_In_X>1279</Param_Move_In_X>"
+            "<Param_Move_In_Y>238</Param_Move_In_Y><Param_Move_In_Direction>2</Param_Move_In_Direction>"
+            "</OTIMSG></Param_Move_In_Info><NP_Cmd>Cmd_Force_Remote_To_Switch_Local</NP_Cmd>" + self.PIPE)
+        self.assertEqual((d["move_in_direction"], d["move_in_x"], d["move_in_y"]), (2, 1279, 238))
+
+    def test_other_commands_unchanged(self):
+        self.assertEqual(u.decode_km_switch("<NP_Cmd>Cmd_Transfer_Clipboard</NP_Cmd>"), {})
+        d = self._describe("<NP_Cmd>Cmd_Drag_File_Is_Beginning</NP_Cmd>" + self.PIPE)
+        self.assertEqual(d["np_cmd"], "Cmd_Drag_File_Is_Beginning")
+
+    def test_late_send_drop_data_lists_files(self):
+        d = self._describe(
+            "<NP_Cmd>Cmd_Late_Send_Drop_Data</NP_Cmd><Param_Clipboard_Info_2><OTIMSG><NodeInfoList>"
+            "<Line><NodeInfo>00</NodeInfo></Line></NodeInfoList>"
+            "<CB_Format_Type>CB_Format_File</CB_Format_Type></OTIMSG></Param_Clipboard_Info_2>")
+        self.assertEqual((d["np_cmd"], d["cb_format"], d["files"]),
+                         ("Cmd_Late_Send_Drop_Data", "CB_Format_File", 1))
+
+
 class TestNodeInfo(unittest.TestCase):
     """CB_Format_File NodeInfo: 824-byte little-endian record (xfer capture)."""
 

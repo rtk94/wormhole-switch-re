@@ -189,6 +189,42 @@ good, no data phase. Payload byte 0 going `01` → `00` looks like a
 press/release pair or a state toggle, not a Consumer usage; what triggered
 it is open.
 
+### Windows peer: `0xD9` frames compared with the Mac (#50)
+
+The follow-up Windows session (raw capture private; 20 334 `0xD9` frames
+from the Windows GoBridge, 5 250 HID reports delivered to Windows) was
+checked against the layout above.  No capture holds the Mac's own `0xD9`
+CDBs (the dtrace logs cover file transfers only), so the Mac side is read
+from what the cable delivered: forwarding copies `payload[0..3]` into the
+boot-mouse report and `payload[0..7]` into the boot-keyboard report, so a
+report is the Mac's payload prefix.  A byte-for-byte comparison of whole
+Mac CDBs is still open; `tools/gobridge_scsi.d` on the Mac during keyboard
+and mouse use would close it.
+
+| | Windows → cable (`0xD9`) | Cable → Windows (reports, from the Mac) |
+|---|---|---|
+| Framing | All 20 334 are 16 bytes, footer `OT`, CSW good; none truncated to 15 | n/a |
+| Mouse `'3'` | 19 932 frames.  Only `payload[0..3]` is ever non-zero: buttons (`1` left, `2` right), X, Y, wheel as signed bytes (wheel `01` 185 times, `ff` 190); `payload[4..11]` always 0 | 4 993 four-byte EP3 reports, same field order; wheel not exercised from the Mac |
+| Keyboard `'4'` | 386 frames; `payload[0]` modifiers, `[1]` 0, `[2..7]` usages (up to three held: `1e 1f 20` for the digits of "wormhole 123"); `payload[8..11]` always 0 | 256 eight-byte EP4 reports, same layout |
+| Volume Up on the Mac keyboard | n/a | One report with usage `0x80` in byte 2: it travels as a keyboard report (`'4'`), as the dylib mapping above predicts, not as `'6'` |
+| Media keys on the Windows keyboard | None: no `'6'` frame and no `0x7f`–`0x81` usage during the step | n/a |
+
+The Windows media keys are inconclusive, not a negative result: the keys
+were pressed on the VM viewer's host keyboard and probably never reached
+the guest.  Injecting them with `virsh send-key` would settle it.
+
+The other `0xD9` types in the capture are not HID:
+
+- `d9 39 00…` (`RejectRemoteTX`, [`upipe-protocol.md`](upipe-protocol.md))
+  four times in a row right after Windows' Login and the Mac's first
+  `DomainFolders`/`DriveInfo`, and three times when the Mac announced a drag
+  (`Cmd_Drag_File_Is_Beginning`).
+- `d9 3a 01…` once, before the Login.
+- `d9 36` twice with payload `01`, twice with `00` (as in the first
+  session): again once before the Login and once 0.2 s after the first
+  Mac → Windows file paste finished, but not after the two pastes that
+  followed.  Still unexplained; not media keys.
+
 ### Parser support (`tools/wormhole_parse.py`)
 
 The parser decodes both directions (verify with the live-capture
