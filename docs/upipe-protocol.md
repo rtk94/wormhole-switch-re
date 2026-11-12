@@ -671,6 +671,60 @@ sends the same `0x10` request as a clipboard paste, for the shared path
 (session 106, file ID 107: here the file ID did not equal the session ID).
 The replies are those of [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents).
 
+### XmlPacket (`0x39`): keyboard/mouse switching and drag and drop
+
+Moving the pointer off a screen edge, to the other PC, is negotiated over
+UPipe with three XmlPackets (same envelope as the clipboard; `NP_Cmd` names
+the command).  Captured between a Windows peer and the Mac with the pointer
+crossing the edge 25 times (15 Windows → Mac, 10 Mac → Windows); decoded by
+`decode_km_switch` in `tools/upipe_peer.py`.  The keystrokes and movements
+themselves still travel as `0xD9` HID frames
+([`transport.md`](transport.md)); these commands only hand control over.
+
+| `NP_Cmd` | Sent by | Fields (decoded names) |
+|---|---|---|
+| `Cmd_Notify_KM_Switch_To_Remote` | the PC the pointer leaves | `Param_Move_Out_Info`: direction, exit `X`/`Y`, `KM_Switch_Option`, `Use_Hotkey_Switch_Only`, `Other_PC_Position_Option`, `Remote_Screen_Width`/`Height`, a nested `Param_KM_Setting_Info`; Windows adds `Param_Point_Event_Data` |
+| `Cmd_Get_KM_Switch_Acknowlege` | the PC the pointer enters | `Param_Remote_Screen_Size`: Windows sends screen and virtual-screen size and origin plus Num/Caps/Scroll Lock; the Mac only Caps Lock and `Param_ScrollDirection` (`Normal`) |
+| `Cmd_Force_Remote_To_Switch_Local` | the PC the pointer entered, when it comes back | `Param_Move_In_Info`: direction, entry `X`/`Y` |
+
+One cycle is always `Notify` (leaving PC), `Acknowlege` (entered PC), then
+`Force_Remote_To_Switch_Local` (entered PC, when the pointer returns);
+frame order in the capture, no `ResponseResult` in either direction.
+
+- Direction and position values: 1 = left, 2 = right.  With "Left of this
+  PC" set on Windows and "Right of this PC" on the Mac, the Windows
+  cursor left at `x = -3`..`-14` with direction 1 and position 1, and the
+  Mac's at `x = 1279` (a 1280 px wide screen) with direction 2 and
+  position 2.  The `Y` values are the pointer's height when it crossed.
+- `KM_Switch_Option` was 3 and `Use_Hotkey_Switch_Only` 0 in every packet;
+  what other values do is untested.
+- `Param_Point_Event_Data` (Windows only) is 32 bytes of hex: eight
+  little-endian u32 with the screen size (`0x500`, `0x320` = 1280 × 800) at
+  words 1 and 2, and the exit point (`0x4FF` = 1279, then the same `Y` as
+  `Move_Out_Y`) in the last two.  Looks like a `POINT`/mouse-event record;
+  the other words are zero.
+- Windows nests `Param_KM_Setting_Info` as escaped XML (`&lt;OTIMSG&gt;…`),
+  the Mac as plain XML; the decoder unescapes once.  The Mac's setting block
+  also carries `Switch_Only_Keydown`, `Temp_KM_Setting` and
+  `Temp_Clipboard_Sending_Setting`/`Receive_Setting` (all 0).
+
+**Drag and drop** uses the same switching, then:
+
+- Mac → Windows: `Cmd_Notify_KM_Switch_To_Remote`, `Cmd_Drag_File_Is_Beginning`
+  (empty body besides the pipe name) and `Cmd_Late_Send_Drop_Data`
+  (`CB_Format_File` with a `NodeInfoList`, same records as
+  [the clipboard](#xmlpacket-0x39-clipboard)) arrive within 0.1 s of each
+  other when the drag enters Windows; Windows then sends one `0x10`
+  (4.7 s later) and gets `0xa1`, `0xa3`, `0x37` and `0xa7` back, the
+  same exchange as a paste.
+- Windows → Mac: no `Drag_File_Is_Beginning` was seen.  Windows sent
+  `Late_Send_Drop_Data` 3.7 s after its `Notify`; the Mac fetched with `0x10`
+  24 s later, and Windows answered with `0xa1`, a `0x3a` MultipleFilePackage
+  and the `0xa7` trailer.
+- The paths in `Late_Send_Drop_Data` are the source PC's: Windows
+  `C:\Users\…\file`, the Mac's `/\Users\…` form.  The raw capture's paths
+  stay private.
+
 ### Windows ↔ Mac session (#50)
 
 A guided session (`tools/windows_capture.ps1`, 22 steps) with the Windows
@@ -687,7 +741,25 @@ usbmon on the host. Every command decodes (222 commands, no errors).
 | Copy files on the Mac, paste in Explorer | `0x39` `CB_Format_File` only; Windows sent no `0x10` | Nothing pasted (twice, also in the abort step) |
 | Copy a folder on the Mac, paste in Explorer | Windows walks it with `0x04` (`//Users/…/` paths) and fetches each file with `0x10` | Tree arrived |
 | Cancel a 200 MiB copy | `0x11`, then `0x0f`s (see [DownloadMultipleFile](#downloadmultiplefile-0x10-file-contents)) | Cancelled |
-| Remote browser, drag and drop, keyboard and mouse | No UPipe traffic | Not exercised: no remote browser found in the Windows UI; drag and drop did nothing either way; the VM's window kept the host's pointer |
+| Remote browser, drag and drop, keyboard and mouse | No UPipe traffic | Not exercised in this session; see the follow-up below |
+
+#### Follow-up session
+
+A second run (`-Plan followup`, 15 steps, 463 504 packets) with the VM's
+USB tablet removed, so the pointer could cross to the Mac.
+
+| Step | Wire | Result |
+|---|---|---|
+| Keyboard and mouse, Windows → Mac and back | [switch handshakes](#xmlpacket-0x39-keyboardmouse-switching-and-drag-and-drop), 25 cycles; `0xD9` HID frames | Worked.  Media keys on the Windows keyboard did nothing on the Mac, with either function-key mode |
+| Mac → Windows file paste in Explorer, on the Desktop, two files with a replace prompt | `0x10` from Windows, then `0xa1`, `0xa3`, `0x37`, `0xa7` | Worked each time (the first session did not: see below) |
+| Drag and drop both ways | [`Late_Send_Drop_Data`](#xmlpacket-0x39-keyboardmouse-switching-and-drag-and-drop) | Worked; Windows → Mac slowly (24 s from drop to the Mac's `0x10`) |
+| Remote browser, from the Windows UI and from the Mac | Windows never sent `0x04`; a new Login exchange with `0xad` and `0xa4` appeared during the Mac step | No browser window on either side |
+| Idle, 30 s | Polls only | |
+
+The Mac → Windows paste that did nothing in the first session worked in
+this one, with the Mac controlling Windows through the pointer switch.
+That session had no pointer switch at all; this is the likely difference,
+unconfirmed.
 
 Outside UPipe, Windows sent four HID `d9 36` frames (payload `01`, `01`,
 `00`, `00`) during the folder paste; see [`transport.md`](transport.md).
@@ -794,16 +866,17 @@ Mac-side items are tracked in #51; the Windows formats and parity in #50.
 - The upload abort (`0x14`) and the Mac's answer to an abort from the
   serving side; `0x11`/`0x0f` are captured (Mac → Windows) and nothing
   answered them.
-- Mac → Windows file paste: Windows received the `CB_Format_File`
-  XmlPacket but sent no `0x10`, and nothing was pasted (a folder works).
-  Whether Explorer's paste needs something the VM lacks, or files must be
-  pasted another way.
+- Mac → Windows file paste: nothing was pasted in the first session and
+  everything in the follow-up.  Whether the pointer switch (or the Mac
+  being the controlling PC) is what makes Windows fetch.
 - The remaining clipboard formats (`CB_Format_MutipleImages`, PDF); text,
   Unicode text, RTF, HTML, DIB, file, folder (Windows) and text, Apple RTF,
   Apple TIFF, file (Mac) are seen.
-- The four `d9 36` frames from Windows ([`transport.md`](transport.md)).
-- Keyboard and mouse sharing, the remote browser and drag and drop with a
-  Windows peer: not exercised yet (the VM window keeps the pointer).
+- The `d9 36` frames from Windows (eight in two sessions) and the single `d9 3a`: [`transport.md`](transport.md) § Windows peer.  `d9 39` (`RejectRemoteTX`) also came from Windows seven times: four after its Login, three when a drag began.
+- The remote browser with a Windows peer: no window opened on either side,
+  so `0x04` from Windows is still unseen.  `KM_Switch_Option` values other
+  than 3, `Use_Hotkey_Switch_Only` and the temp settings, and the Windows
+  media keys that sent nothing.
 - What the Mac does with a Windows peer's DomainFolders (Finder sidebar
   entries?) and the misc-info file it points to.
 - `DUMMY_DATA` contents, and what the `0xF0` CDB returns.
